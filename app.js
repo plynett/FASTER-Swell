@@ -13,6 +13,7 @@ const TRANSECT_HIT_WEIGHT_MULTIPLIER = 3.2;
 const MIN_TRANSECT_HIT_WEIGHT = 9;
 const DEFAULT_TIDE_PREVIEW_HOURS = 240;
 const FEET_PER_METER = 3.28084;
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
 const COLORS = {
   navy: "#11314c",
@@ -57,12 +58,16 @@ const state = {
   canvasRenderer: null,
   waveChart: null,
   tideChart: null,
+  lockedTopRowHeight: null,
+  topRowHeightFrame: null,
   displayUnits: "metric",
   timeMode: "utc",
 };
 
 const dom = {
   appStatus: document.getElementById("appStatus"),
+  mapPanel: document.querySelector(".map-panel"),
+  transectPanel: document.querySelector(".transect-panel"),
   selectedTransectLabel: document.getElementById("selectedTransectLabel"),
   selectionTitle: document.getElementById("selectionTitle"),
   dataAvailabilityPill: document.getElementById("dataAvailabilityPill"),
@@ -215,8 +220,52 @@ async function init() {
   const demoTransect = state.transects.find((transect) => transect.label === DEMO_LABEL) || state.transects[0];
   await selectTransect(demoTransect, { flyTo: false });
   await runModel();
+  scheduleTopRowHeightCapture();
 
   setAppStatus("Prototype ready. Zoom in and click a transect to explore.");
+}
+
+function scheduleTopRowHeightCapture() {
+  if (state.topRowHeightFrame) {
+    window.cancelAnimationFrame(state.topRowHeightFrame);
+  }
+  state.topRowHeightFrame = window.requestAnimationFrame(() => {
+    state.topRowHeightFrame = null;
+    captureTopRowHeight();
+  });
+}
+
+function captureTopRowHeight() {
+  if (!dom.mapPanel || !dom.transectPanel) {
+    return;
+  }
+
+  const previousMapHeight = dom.mapPanel.style.height;
+  const previousTransectHeight = dom.transectPanel.style.height;
+  dom.mapPanel.style.height = "";
+  dom.transectPanel.style.height = "";
+
+  const nextHeight = Math.ceil(
+    Math.max(dom.mapPanel.getBoundingClientRect().height, dom.transectPanel.getBoundingClientRect().height)
+  );
+
+  dom.mapPanel.style.height = previousMapHeight;
+  dom.transectPanel.style.height = previousTransectHeight;
+
+  if (nextHeight > 0) {
+    state.lockedTopRowHeight = nextHeight;
+    applyTopRowHeightLock();
+  }
+}
+
+function applyTopRowHeightLock() {
+  if (!state.lockedTopRowHeight || !dom.mapPanel || !dom.transectPanel) {
+    return;
+  }
+  const heightPx = `${state.lockedTopRowHeight}px`;
+  dom.mapPanel.style.height = heightPx;
+  dom.transectPanel.style.height = heightPx;
+  state.map?.invalidateSize(false);
 }
 
 function initMap() {
@@ -255,6 +304,7 @@ function initMap() {
     if (state.results) {
       updatePlaybackUI();
     }
+    scheduleTopRowHeightCapture();
   });
   window.setTimeout(() => {
     state.map.invalidateSize(false);
@@ -405,8 +455,8 @@ async function selectTransect(transect, options = {}) {
   dom.waveChartTitle.textContent = `MOP Wave Forecast - Transect ${transect.label}`;
   dom.tideChartTitle.textContent = "NOAA Tide Prediction";
   dom.dataAvailabilityPill.textContent = state.selectedDatasetMeta
-    ? "Live MOP on run + local fallback"
-    : "Live MOP on run";
+    ? "Live MOP + fallback"
+    : "Live MOP ready";
   dom.runStatusPill.textContent = "Awaiting run";
   dom.forecastEmptyState.classList.remove("hidden");
   dom.forecastContent.classList.add("hidden");
@@ -426,6 +476,7 @@ async function selectTransect(transect, options = {}) {
   const defaults = getDefaultsForTransect(transect.label);
   applyModelParams(defaults);
   updateGeometryPreview();
+  applyTopRowHeightLock();
   syncVisibleTransects();
 
   if (options.flyTo) {
@@ -506,6 +557,7 @@ async function runModel() {
     dom.dataAvailabilityPill.textContent = "NOAA tide only";
     dom.runStatusPill.textContent = "NOAA tide preview ready";
     setGeometryHelper("Nearest NOAA tide predictions loaded. Add local wave forecast data for full runup playback.");
+    scheduleTopRowHeightCapture();
     return;
   }
 
@@ -539,12 +591,15 @@ async function runModel() {
   dom.runupContent.classList.remove("hidden");
   dom.runStatusPill.textContent = "Forecast ready";
 
+  const playbackStartIndex = getPlaybackStartIndex(state.results);
+  dom.timeSlider.min = String(playbackStartIndex);
   dom.timeSlider.max = String(Math.max(state.results.length - 1, 0));
-  state.currentIndex = Math.min(state.currentIndex, state.results.length - 1);
+  state.currentIndex = Math.max(playbackStartIndex, Math.min(state.currentIndex, state.results.length - 1));
   dom.timeSlider.value = String(state.currentIndex);
 
   renderCharts(forecastDataset, tideSeries);
   updatePlaybackUI();
+  scheduleTopRowHeightCapture();
 }
 
 function handleParameterInput() {
@@ -1312,7 +1367,7 @@ function destroyForecastCharts() {
 
 function renderTideOnlyPreview(tideSeries, tideWindow) {
   const tidePoints = tideSeries.timeMs.map((timeMs, index) => ({ x: timeMs, y: convertElevationForDisplay(tideSeries.level[index]) }));
-  const timeMin = tideWindow.startMs;
+  const timeMin = getPlaybackStartTime(tideSeries.timeMs, tideWindow.startMs);
   const timeMax = tideWindow.endMs;
 
   dom.waveChartTitle.textContent = `MOP Wave Forecast - Transect ${state.selectedTransect.label}`;
@@ -1425,7 +1480,7 @@ function renderCharts(forecastDataset, tideSeries) {
   const wavePoints = forecastDataset.waveTimeMs.map((timeMs, index) => ({ x: timeMs, y: convertElevationForDisplay(forecastDataset.waveHs[index]) }));
   const periodPoints = forecastDataset.waveTimeMs.map((timeMs, index) => ({ x: timeMs, y: forecastDataset.waveTp[index] }));
   const tidePoints = tideSeries.timeMs.map((timeMs, index) => ({ x: timeMs, y: convertElevationForDisplay(tideSeries.level[index]) }));
-  const timeMin = forecastDataset.waveTimeMs[0];
+  const timeMin = getPlaybackStartTime(forecastDataset.waveTimeMs, forecastDataset.waveTimeMs[0]);
   const timeMax = forecastDataset.waveTimeMs.at(-1);
 
   dom.waveChartTitle.textContent = `MOP Wave Forecast - Transect ${state.selectedTransect.label}`;
@@ -1579,10 +1634,17 @@ function updatePlaybackUI() {
     return;
   }
 
+  const playbackStartIndex = getPlaybackStartIndex(state.results);
+  if (state.currentIndex < playbackStartIndex) {
+    state.currentIndex = playbackStartIndex;
+  }
+
   const current = state.results[state.currentIndex];
+  const forecastResults = getForecastResultsWindow(state.results);
+  const worstCategory = getWorstOvertoppingCategory(forecastResults) || current.category;
   dom.timeSlider.value = String(state.currentIndex);
   dom.sliderTimeLabel.textContent = formatShortDateTime(current.timeMs);
-  dom.sliderIndexLabel.textContent = `${state.currentIndex + 1} / ${state.results.length}`;
+  dom.sliderIndexLabel.textContent = `${state.currentIndex - playbackStartIndex + 1} / ${state.results.length - playbackStartIndex}`;
   dom.currentTimeLabel.textContent = `${formatShortDateTime(current.timeMs)} ${getTimeModeLabel()}`;
 
   dom.metricGrid.innerHTML = [
@@ -1608,15 +1670,15 @@ function updatePlaybackUI() {
     ],
     yMin: -5,
     yMax: Math.max(state.modelParams.duneCrestElevation + 1.2, current.upperBoundRunup + 1.2, current.maxCrest + 1.2),
-    title: `Runup profile at ${formatShortDateTime(current.timeMs)} ${getTimeModeLabel()}`,
+    title: `Runup profile at ${formatShortDateTime(current.timeMs)} ${getTimeModeLabel()} - ${current.category.figureLabel}`,
     figureAspectRatio,
     footerLines: [],
     showLegend: true,
   });
 
-  dom.categoryPill.textContent = current.category.label;
-  dom.categoryPill.style.background = current.category.background;
-  dom.categoryPill.style.color = current.category.color;
+  dom.categoryPill.textContent = formatForecastOvertoppingLabel(worstCategory, forecastResults);
+  dom.categoryPill.style.background = worstCategory.background;
+  dom.categoryPill.style.color = worstCategory.color;
   dom.playPauseButton.textContent = state.isPlaying ? "Pause" : "Play";
 
   if (state.waveChart && state.tideChart) {
@@ -1644,6 +1706,11 @@ function togglePlayback() {
     stopPlayback();
     updatePlaybackUI();
     return;
+  }
+
+  const playbackStartIndex = getPlaybackStartIndex(state.results);
+  if (state.currentIndex < playbackStartIndex) {
+    state.currentIndex = playbackStartIndex;
   }
 
   state.isPlaying = true;
@@ -1903,30 +1970,107 @@ function normalizeTideStation(rawStation) {
 function classifyOvertopping({ expectedRunup, conservativeRunup, upperBoundRunup, duneCrestElevation }) {
   if (expectedRunup > duneCrestElevation) {
     return {
+      rank: 3,
       label: "Significant overtopping probable",
+      forecastLabel: "Significant Overtopping probable",
+      figureLabel: "Significant Overtopping Probable",
       background: "rgba(229, 103, 82, 0.18)",
       color: "#9b2f1d",
     };
   }
   if (conservativeRunup > duneCrestElevation) {
     return {
+      rank: 2,
       label: "Moderate overtopping possible",
+      forecastLabel: "Moderate Overtopping possible",
+      figureLabel: "Moderate Overtopping Possible",
       background: "rgba(243, 194, 107, 0.22)",
       color: "#8a5d0a",
     };
   }
   if (upperBoundRunup > duneCrestElevation) {
     return {
+      rank: 1,
       label: "Minor overtopping possible",
+      forecastLabel: "Minor Overtopping possible",
+      figureLabel: "Minor Overtopping Possible",
       background: "rgba(34, 183, 167, 0.18)",
       color: "#0d6b61",
     };
   }
   return {
+    rank: 0,
     label: "Overtopping not expected",
+    forecastLabel: "Overtopping not expected",
+    figureLabel: "Overtopping Not Expected",
     background: "rgba(17, 49, 76, 0.12)",
     color: "#11314c",
   };
+}
+
+function getWorstOvertoppingCategory(results) {
+  if (!results?.length) {
+    return null;
+  }
+
+  return results.reduce((worstCategory, result) => {
+    if (!worstCategory || result.category.rank > worstCategory.rank) {
+      return result.category;
+    }
+    return worstCategory;
+  }, null);
+}
+
+function getForecastResultsWindow(results) {
+  if (!results?.length) {
+    return [];
+  }
+
+  const playbackStartIndex = getPlaybackStartIndex(results);
+  return results.slice(playbackStartIndex);
+}
+
+function getPlaybackStartIndex(results) {
+  if (!results?.length) {
+    return 0;
+  }
+
+  const nowMs = Date.now();
+  for (let index = results.length - 1; index >= 0; index -= 1) {
+    if (results[index].timeMs <= nowMs) {
+      return index;
+    }
+  }
+  return 0;
+}
+
+function getPlaybackStartTime(timeValues, fallbackTime) {
+  if (!timeValues?.length) {
+    return fallbackTime;
+  }
+
+  const nowMs = Date.now();
+  for (let index = timeValues.length - 1; index >= 0; index -= 1) {
+    if (timeValues[index] <= nowMs) {
+      return timeValues[index];
+    }
+  }
+  return timeValues[0] ?? fallbackTime;
+}
+
+function formatForecastOvertoppingLabel(category, results) {
+  if (!category) {
+    return "--";
+  }
+
+  const startMs = results?.[0]?.timeMs;
+  const endMs = results?.at(-1)?.timeMs;
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) {
+    return category.forecastLabel;
+  }
+
+  const dayCount = Math.max(1, Math.ceil((endMs - startMs) / MS_PER_DAY));
+  return `${category.forecastLabel} over next ${dayCount} day${dayCount === 1 ? "" : "s"}`;
 }
 
 function distanceToCenter(transect, center) {
