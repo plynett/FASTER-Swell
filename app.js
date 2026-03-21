@@ -1,4 +1,5 @@
 const DEMO_LABEL = "OC400";
+const TRANSECT_QUERY_PARAM = "transect";
 const TRANSECT_ZOOM_THRESHOLD = 9;
 const MAX_RENDERED_TRANSECTS = 1400;
 const NOAA_STATIONS_CSV_URL = "./data/noaa_ca_tide_stations.csv";
@@ -218,7 +219,15 @@ async function init() {
   bindControls();
 
   const demoTransect = state.transects.find((transect) => transect.label === DEMO_LABEL) || state.transects[0];
-  await selectTransect(demoTransect, { flyTo: false });
+  const requestedTransectLabel = getRequestedTransectLabelFromLocation();
+  const requestedTransect = findTransectByLabel(requestedTransectLabel);
+  if (requestedTransectLabel && !requestedTransect) {
+    console.warn("[FASTER Explorer] Requested transect was not found.", {
+      requestedTransectLabel,
+    });
+  }
+
+  await selectTransect(requestedTransect || demoTransect, { flyTo: Boolean(requestedTransect) });
   await runModel();
   scheduleTopRowHeightCapture();
 
@@ -472,6 +481,7 @@ async function selectTransect(transect, options = {}) {
   dom.categoryPill.textContent = "--";
   dom.categoryPill.style.background = "rgba(243, 194, 107, 0.18)";
   dom.categoryPill.style.color = "#7a5413";
+  syncSelectedTransectUrl(transect.label);
 
   const defaults = getDefaultsForTransect(transect.label);
   applyModelParams(defaults);
@@ -488,6 +498,53 @@ async function selectTransect(transect, options = {}) {
   const tideStation = await resolveTideStation(transect);
   state.selectedTideStation = tideStation;
   dom.tideChartTitle.textContent = formatTideChartTitle(tideStation);
+}
+
+function getRequestedTransectLabelFromLocation() {
+  const url = new URL(window.location.href);
+  const queryTransect = normalizeTransectLabel(url.searchParams.get(TRANSECT_QUERY_PARAM));
+  if (queryTransect) {
+    return queryTransect;
+  }
+
+  const rawHash = window.location.hash.replace(/^#/, "").trim();
+  if (!rawHash) {
+    return null;
+  }
+
+  if (rawHash.includes("=")) {
+    const hashParams = new URLSearchParams(rawHash.startsWith("?") ? rawHash.slice(1) : rawHash);
+    return normalizeTransectLabel(hashParams.get(TRANSECT_QUERY_PARAM));
+  }
+
+  return normalizeTransectLabel(rawHash);
+}
+
+function normalizeTransectLabel(value) {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const trimmedValue = value.trim();
+  return trimmedValue ? trimmedValue.toUpperCase() : null;
+}
+
+function findTransectByLabel(label) {
+  const normalizedLabel = normalizeTransectLabel(label);
+  if (!normalizedLabel) {
+    return null;
+  }
+  return state.transects.find((transect) => normalizeTransectLabel(transect.label) === normalizedLabel) || null;
+}
+
+function syncSelectedTransectUrl(transectLabel) {
+  if (!transectLabel || !window.history?.replaceState) {
+    return;
+  }
+
+  const url = new URL(window.location.href);
+  url.searchParams.set(TRANSECT_QUERY_PARAM, transectLabel);
+  url.hash = "";
+  window.history.replaceState({ transect: transectLabel }, "", url.toString());
 }
 
 async function runModel() {
