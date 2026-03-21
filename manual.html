@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FASTER-Swell Technical Information &amp; Users Manual</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body class="manual-page">
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand-block">
+        <p class="eyebrow">California Coastal Flooding Prototype</p>
+        <h1>FASTER-Swell Coastal Forecast Explorer</h1>
+      </div>
+      <div class="topbar-meta">
+        <a class="status-pill topbar-link" href="./index.html">Back to Forecast Explorer</a>
+      </div>
+    </header>
+
+    <main class="manual-layout manual-report">
+      <section class="panel manual-hero">
+        <p class="panel-eyebrow">Technical Information</p>
+        <h2>Users Manual and Technical Basis</h2>
+        <p class="manual-hero-copy">
+          FASTER-Swell is a low-computation coastal forecast workflow for estimating maximum wave crest elevation,
+          2% exceedance runup, overtopping likelihood, and wave-driven flooding potential along California shorelines.
+          The Explorer combines nearshore wave forecasts from the CDIP MOP alongshore model, NOAA tide predictions,
+          and a simplified user-edited beach or structure profile to produce a transect-by-transect operational view.
+        </p>
+        <div class="manual-summary-grid">
+          <article class="manual-summary-card">
+            <strong>Primary objective</strong>
+            <span>Provide a short-term swell impact forecast that helps interpret flooding, overtopping, berm performance, and pier or wharf exposure.</span>
+          </article>
+          <article class="manual-summary-card">
+            <strong>Hydrodynamic inputs</strong>
+            <span>CDIP MOP wave height, peak period, peak direction, prediction depth, and nearest NOAA tide predictions in MLLW.</span>
+          </article>
+          <article class="manual-summary-card">
+            <strong>Geometry inputs</strong>
+            <span>User-defined slope, toe elevation, toe distance, crest elevation, crest distance, sea-level anomaly, and local chop adjustment.</span>
+          </article>
+          <article class="manual-summary-card">
+            <strong>Outputs</strong>
+            <span>Wave and tide playback, maximum crest, expected runup, conservative runup, upper-bound runup, and overtopping category.</span>
+          </article>
+        </div>
+      </section>
+
+      <section class="panel manual-panel">
+        <h2>Purpose and Scope</h2>
+        <div class="manual-richtext">
+          <p>
+            The background documents describe FASTER-Swell as a forecast tool for large wind-wave and swell events,
+            not a tsunami model. The method is intended for event windows on the order of several days and is designed
+            to answer questions such as: How high can wave crests reach near a pier deck? Will a temporary berm or dune
+            likely be overtopped? Is wave-driven flooding likely on a coastal road or backshore area?
+          </p>
+          <p>
+            The operational concept is to start with wave conditions already predicted by the MOP system near the
+            10 m depth contour, combine those conditions with NOAA tides and a user-defined shoreline geometry,
+            then evaluate several empirical runup formulations to produce decision-ready water-level estimates.
+          </p>
+        </div>
+      </section>
+
+      <section class="panel manual-panel-wide">
+        <h2>Operational Data Flow</h2>
+        <ol class="manual-steps">
+          <li>The Explorer loads statewide MOP transects from <code>transects.kml</code> via the compact web export.</li>
+          <li>When a transect is selected, the app requests the corresponding CDIP MOP forecast directly from the THREDDS DAP2 ASCII endpoint.</li>
+          <li>The app resolves the nearest NOAA tide station from the California station list and downloads hourly tide predictions in MLLW.</li>
+          <li>The Geometry Editor defines a stylized profile using the user inputs. Dune mode returns landward to the toe elevation; structure mode remains elevated landward of crest.</li>
+          <li>For each forecast time, the app computes equivalent deep-water wave properties, breaker conditions, runup estimates, and summary water levels.</li>
+          <li>The Explorer displays the wave and tide time series, allows playback through forecast time, and plots the selected-time water levels across the edited profile.</li>
+        </ol>
+      </section>
+
+      <section class="panel manual-panel-wide">
+        <h2>Geometry Representation</h2>
+        <div class="equation-grid">
+          <article class="equation-card">
+            <h3>Beach face and toe location</h3>
+            <div class="equation-math">
+              z<sub>min</sub> = -5 m (internal reference)<br>
+              x<sub>linear,end</sub> = (z<sub>toe</sub> - z<sub>min</sub>) / &beta;<br>
+              x<sub>flat</sub> = x<sub>linear,end</sub> + W<sub>toe</sub>
+            </div>
+            <p>The Explorer builds the seaward profile from a constant average slope &beta; up to the dune or structure toe elevation, then applies a flat toe/berm segment.</p>
+            <p class="equation-ref">Source: current Explorer implementation in <code>web/app.js</code>.</p>
+          </article>
+          <article class="equation-card">
+            <h3>Dune or structure crest shape</h3>
+            <div class="equation-math">
+              W<sub>d</sub> = 2 W<sub>toe-crest</sub><br>
+              x<sub>c</sub> = x<sub>flat</sub> + W<sub>d</sub> / 2<br>
+              A = z<sub>crest</sub> - z<sub>toe</sub><br>
+              &sigma; = W<sub>d</sub> / 6<br>
+              z(x) = z<sub>toe</sub> + A exp(-(x - x<sub>c</sub>)<sup>2</sup> / (2&sigma;<sup>2</sup>))
+            </div>
+            <p>
+              The dune/structure crest is represented with a Gaussian rise over the specified toe-to-crest distance.
+              In dune mode the landward side returns to the toe elevation; in structure mode the landward side remains at crest elevation.
+            </p>
+            <p class="equation-ref">Source: current Explorer implementation in <code>web/app.js</code>.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="panel manual-panel-wide">
+        <h2>Hydrodynamic and Runup Equations</h2>
+        <div class="manual-note">
+          <h3>Terminology note</h3>
+          <p>
+            The local project files sometimes refer to the Stockdon formulation as "Stockton." In this manual the published
+            name <strong>Stockdon et al. (2006)</strong> is used. The formulas below match the project formula sheet and the current code path.
+          </p>
+        </div>
+
+        <div class="equation-section">
+          <h3>1. Conversion from nearshore prediction point to equivalent deep-water properties</h3>
+          <div class="equation-grid">
+            <article class="equation-card">
+              <h3>Shallow-water and deep-water wavelengths</h3>
+              <div class="equation-math">
+                L<sub>s</sub> = (g T<sub>p</sub><sup>2</sup> / 2&pi;) &radic;tanh(4&pi;<sup>2</sup>d / (T<sub>p</sub><sup>2</sup> g))<br>
+                L<sub>o</sub> = g T<sub>p</sub><sup>2</sup> / (2&pi;)
+              </div>
+              <p>These are the nearshore and equivalent deep-water wavelengths used throughout the transformation and runup calculations.</p>
+              <p class="equation-ref">Source: project formulas sheet; implemented in <code>FASTER_MOPS.py</code> and <code>web/app.js</code>.</p>
+            </article>
+            <article class="equation-card">
+              <h3>Group factor, wave angle, shoaling, refraction, deep-water wave height</h3>
+              <div class="equation-math">
+                k = 2&pi; / L<sub>s</sub><br>
+                n<sub>s</sub> = 0.5 [1 + 2kd / sinh(2kd)]<br>
+                ang<sub>s</sub> = D<sub>p</sub> - &theta;<sub>shore-normal</sub><br>
+                ang<sub>d</sub> = sin<sup>-1</sup>[(L<sub>o</sub> / L<sub>s</sub>) sin(ang<sub>s</sub>)]<br>
+                K<sub>s</sub> = &radic;[n<sub>s</sub>L<sub>s</sub> / (0.5L<sub>o</sub>)]<br>
+                K<sub>r</sub> = &radic;[cos(ang<sub>s</sub>) / cos(ang<sub>d</sub>)]<br>
+                H<sub>o</sub> = K<sub>s</sub> K<sub>r</sub> H<sub>s,swell</sub>
+              </div>
+              <p>The documented method uses the forecast mean wave direction relative to shoreline normal. The present Python and Explorer implementation currently set the operational directional term to zero inside the timestep runup calculation, so the live calculation behaves as a non-directional baseline.</p>
+              <p class="equation-ref">Sources: background docx, formulas sheet, O'Reilly et al. (2016), current code.</p>
+            </article>
+          </div>
+        </div>
+
+        <div class="equation-section">
+          <h3>2. Breaking-wave calculation and maximum crest elevation</h3>
+          <div class="equation-grid">
+            <article class="equation-card">
+              <h3>CEM-style breaking relation</h3>
+              <div class="equation-math">
+                a = 43.75 [1 - exp(-19&beta;)]<br>
+                b = 1.56 / [1 + exp(-19.5&beta;)]<br>
+                H<sub>b</sub> = H<sub>o</sub> K<sub>s,b</sub> K<sub>r,b</sub><br>
+                d<sub>breaking</sub> = H<sub>b</sub> / [b - a H<sub>b</sub> / T<sub>p</sub><sup>2</sup>]
+              </div>
+              <p>The solver iterates on breaking depth until the Coastal Engineering Manual style breaking relation is satisfied.</p>
+              <p class="equation-ref">Source: project formulas sheet, attributed there to the Coastal Engineering Manual breaking-wave-height method; implemented in Python and web code.</p>
+            </article>
+            <article class="equation-card">
+              <h3>Maximum-considered wave crest</h3>
+              <div class="equation-math">
+                z<sub>crest,max</sub> = &eta; + H<sub>b</sub> MaxRatio CrestRatio<br>
+                MaxRatio = 1.3<br>
+                CrestRatio = 0.55
+              </div>
+              <p>
+                Here &eta; is tide plus user-specified sea-level anomaly. The formula sheet treats 1.3 as a representative
+                ratio between maximum-considered wave height and significant wave height, and 0.55 as the FEMA crest fraction of total wave height.
+              </p>
+              <p class="equation-ref">Source: project formulas sheet; implemented in <code>FASTER_MOPS.py</code> and <code>web/app.js</code>.</p>
+            </article>
+          </div>
+        </div>
+
+        <div class="equation-section">
+          <h3>3. 2% exceedance runup formulas</h3>
+          <div class="equation-grid">
+            <article class="equation-card">
+              <h3>Stockdon et al. (2006) total runup</h3>
+              <div class="equation-math">
+                Setup<sub>Stockdon</sub> = 1.1 0.35 &beta; &radic;(L<sub>o</sub>H<sub>o</sub>)<br>
+                Swash<sub>Stockdon</sub> = 1.1 0.5 &radic;[H<sub>o</sub>L<sub>o</sub>(0.563&beta;<sup>2</sup> + 0.0004)]<br>
+                R<sub>2,Stockdon</sub> = &eta; + Setup<sub>Stockdon</sub> + Swash<sub>Stockdon</sub>
+              </div>
+              <p>The project formulas sheet also shows an angle-reduction factor, but the current operational code path does not actively apply it.</p>
+              <p class="equation-ref">Source: Stockdon et al. (2006); project formulas sheet; current implementation.</p>
+            </article>
+            <article class="equation-card">
+              <h3>Park and Cox (2016) berm and dune adjustment</h3>
+              <div class="equation-math">
+                C<sub>&mu;</sub> = 0.8 - 0.4 tanh(2W<sub>b</sub> / L<sub>o</sub>)<br>
+                C<sub>&sigma;</sub> = 1.0 - 0.5 tanh(2W<sub>b</sub> / L<sub>o</sub>)<br>
+                &beta;<sub>f</sub> = arctan(&beta;)<br>
+                &beta;<sub>d</sub> = arctan[(z<sub>crest</sub> - z<sub>toe</sub>) / (0.5W<sub>d</sub>)]<br>
+                &alpha; = min(1, max(0, ((&eta; - z<sub>toe</sub>) + 0.7H<sub>o</sub>) / (1.4H<sub>o</sub>)))<br>
+                &beta;<sub>t</sub> = (1 - &alpha;)&beta;<sub>f</sub> + &alpha;&beta;<sub>d</sub><br>
+                &xi; = tan(&beta;<sub>use</sub>) / &radic;(H<sub>o</sub>/L<sub>o</sub>)<br>
+                R<sub>2,Park,&mu;</sub> = &eta; + 1.35 C<sub>&mu;</sub> H<sub>o</sub> &xi;<sup>0.65</sup><br>
+                R<sub>2,Park,&sigma;</sub> = &eta; + 1.35 C<sub>&sigma;</sub> H<sub>o</sub> &xi;<sup>0.65</sup>
+              </div>
+              <p>The code uses a piecewise choice for &beta;<sub>use</sub>: foreshore angle for low water levels, dune/structure face angle for high water levels, and transition angle in between.</p>
+              <p class="equation-ref">Source: Park and Cox (2016); project formulas sheet; current implementation.</p>
+            </article>
+            <article class="equation-card">
+              <h3>Modified Stockdon with Park-style geometry terms</h3>
+              <div class="equation-math">
+                Setup<sub>mod,&mu;</sub> = 1.1 C<sub>&mu;</sub> 0.35 tan(&beta;<sub>use</sub>) &radic;(L<sub>o</sub>H<sub>o</sub>)<br>
+                Swash<sub>mod,&mu;</sub> = 1.1 0.5 C<sub>&mu;</sub> &radic;[H<sub>o</sub>L<sub>o</sub>(0.563 tanh<sup>2</sup>(&beta;<sub>use</sub>) + 0.0004)]<br>
+                R<sub>2,mod,&mu;</sub> = &eta; + Setup<sub>mod,&mu;</sub> + Swash<sub>mod,&mu;</sub><br>
+                R<sub>2,mod,&sigma;</sub> uses C<sub>&sigma;</sub> in the same two terms
+              </div>
+              <p>This hybrid preserves the Stockdon structure while introducing the berm and dune/structure geometry sensitivity from Park and Cox.</p>
+              <p class="equation-ref">Source: project formulas sheet; current implementation.</p>
+            </article>
+            <article class="equation-card">
+              <h3>Oblique-wave reduction factor</h3>
+              <div class="equation-math">
+                &gamma;<sub>&theta;</sub> = cos(ang<sub>d</sub>)<sup>0.4 + 2.7 tan(&beta;)</sup>
+              </div>
+              <p>This factor appears in the formulas sheet and is attributed there to Ormondt et al. (2021). It is useful conceptually, but it is currently inactive in the main Python and browser timestep loop because the live operational runup calculation is using the non-directional baseline noted above.</p>
+              <p class="equation-ref">Source: project formulas sheet; Ormondt et al. (2021) as cited there.</p>
+            </article>
+          </div>
+        </div>
+
+        <div class="equation-section">
+          <h3>4. Summary metrics used in the Explorer</h3>
+          <div class="equation-grid">
+            <article class="equation-card">
+              <h3>Expected, conservative, and upper-bound runup</h3>
+              <div class="equation-math">
+                R<sub>mean</sub> = mean(R<sub>2,Stockdon</sub>, R<sub>2,Park,&mu;</sub>, R<sub>2,mod,&mu;</sub>)<br>
+                s<sub>R</sub> = stdev(R<sub>2,Stockdon</sub>, R<sub>2,Park,&mu;</sub>, R<sub>2,Park,&sigma;</sub>, R<sub>2,mod,&mu;</sub>, R<sub>2,mod,&sigma;</sub>)<br>
+                &Delta;H = (H<sub>total</sub> - H<sub>swell</sub>) / 2<br>
+                Expected = R<sub>mean</sub><br>
+                Conservative = R<sub>mean</sub> + s<sub>R</sub><br>
+                Upper Bound = R<sub>mean</sub> + s<sub>R</sub> + &Delta;H
+              </div>
+              <p>The upper-bound term uses the difference between total wave height and swell wave height as a simple allowance for local wind-wave or chop uncertainty.</p>
+              <p class="equation-ref">Source: project formulas sheet; current implementation.</p>
+            </article>
+            <article class="equation-card">
+              <h3>Overtopping category logic</h3>
+              <div class="equation-math">
+                If Expected &gt; z<sub>crest</sub> : Significant overtopping probable<br>
+                Else if Conservative &gt; z<sub>crest</sub> : Moderate overtopping possible<br>
+                Else if Upper Bound &gt; z<sub>crest</sub> : Minor overtopping possible<br>
+                Else : Overtopping not expected
+              </div>
+              <p>This is the decision logic that drives the category pill in the Runup Output panel.</p>
+              <p class="equation-ref">Source: current Explorer implementation in <code>web/app.js</code>.</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel manual-panel">
+        <h2>How to Use the Explorer</h2>
+        <ol class="manual-steps">
+          <li>Zoom the Selection Map until local transects appear, then click the transect of interest.</li>
+          <li>Use the top-row toggles in the Geometry Editor to choose dune vs structure geometry, Metric vs English display units, and UTC vs Local Time display.</li>
+          <li>Edit the toe elevation, toe distance, crest elevation, crest distance, sea-level anomaly, and local waves/chop adjustment as needed.</li>
+          <li>Press <strong>Run FASTER MOP</strong> to download live MOP forecast data and NOAA tides, then compute the runup summary.</li>
+          <li>Use the slider or Play button to move through forecast time and inspect how waves, tides, and runup vary through the event window.</li>
+        </ol>
+      </section>
+
+      <section class="panel manual-panel">
+        <h2>How to Read the Output</h2>
+        <ul class="manual-list">
+          <li><strong>MOP Wave Forecast:</strong> blue line is significant wave height Hs, green dashed line is peak period Tp.</li>
+          <li><strong>NOAA Tide Prediction:</strong> tide level in MLLW, with the user-entered sea-level anomaly incorporated into the runup metrics.</li>
+          <li><strong>Playback metrics:</strong> Wave Hs, Peak Period, Tide + Anomaly, Max Crest, Expected 2%, Conservative, and Upper Bound all correspond to the selected slider time.</li>
+          <li><strong>Runup profile:</strong> shows still water, maximum crest, expected runup, conservative runup, and upper-bound runup projected across the edited profile.</li>
+          <li><strong>Category pill:</strong> summarizes whether overtopping is not expected, minor, moderate, or significant, based on comparison with the crest elevation.</li>
+        </ul>
+      </section>
+
+      <section class="panel manual-panel">
+        <h2>Current Implementation Notes</h2>
+        <ul class="manual-list">
+          <li>The Explorer is fully browser-side at runtime. Live MOP forecasts are pulled directly from CDIP THREDDS and NOAA tides are pulled directly from NOAA CO-OPS.</li>
+          <li>The nearest NOAA tide station is resolved from the California tide-station list included with the web app.</li>
+          <li>The current live Python and browser code path uses the non-directional baseline during the runup calculation loop, even though the formulas sheet includes directional wave-angle terms and an oblique-wave reduction factor.</li>
+          <li>The sea-level anomaly and local waves/chop terms are user inputs, not external forecast products in the present Explorer.</li>
+          <li>The profile is stylized and parameterized. It is not a direct survey profile unless those parameters have been tuned to represent local conditions.</li>
+          <li>If no live MOP forecast is available for a transect, the Explorer falls back to a tide-only preview mode.</li>
+        </ul>
+      </section>
+
+      <section class="panel manual-panel-wide">
+        <h2>References</h2>
+        <ul class="reference-list">
+          <li>O'Reilly, W. C., Olfe, C. B., Thomas, J., Seymour, R. J., &amp; Guza, R. T. (2016). <a href="https://doi.org/10.1016/j.coastaleng.2016.05.008">The California coastal wave monitoring and prediction system</a>. <em>Coastal Engineering</em>, 116, 118-132.</li>
+          <li>Stockdon, H. F., Holman, R. A., Howd, P. A., &amp; Sallenger, A. H. (2006). <a href="https://doi.org/10.1016/j.coastaleng.2005.12.005">Empirical parameterization of setup, swash, and runup</a>. <em>Coastal Engineering</em>, 53(7), 573-588.</li>
+          <li>Park, H., &amp; Cox, D. T. (2016). <a href="https://doi.org/10.1016/j.coastaleng.2015.10.006">Empirical wave run-up formula for wave, storm surge and berm width</a>. <em>Coastal Engineering</em>, 115, 67-78.</li>
+          <li>U.S. Army Corps of Engineers. <a href="https://www.publications.usace.army.mil/USACE-Publications/Engineer-Manuals/u43544q/636F617374616C20656E67696E656572696E67206D616E75616C/">Coastal Engineering Manual (EM 1110-2-1100)</a>. Breaking-wave-height guidance is the basis referenced by the project formulas sheet.</li>
+          <li>Project-specific formula and methodology sources: <code>CA Statewide_FASTER_Lynett_Swell_Runup_MaxCrest_formulas.pdf</code>, <code>CA Statewide_FASTER_Lynett_Swell_Runup_MaxCrest.pdf</code>, <code>single_calc.xlsx</code>, and the Python model scripts in <code>Faster_python</code>.</li>
+        </ul>
+      </section>
+    </main>
+  </div>
+</body>
+</html>

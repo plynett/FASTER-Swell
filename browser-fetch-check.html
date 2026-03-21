@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Browser Fetch Check</title>
+</head>
+<body>
+  <pre id="output">Running browser fetch checks...</pre>
+  <script>
+    const cases = [
+      {
+        name: "OpenDAP DAP2 ASCII",
+        url: "https://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/model/MOP_alongshore/OC400_forecast.nc.ascii?waveHs[0:1:5]",
+      },
+      {
+        name: "DAP4 DMR XML",
+        url: "https://thredds.cdip.ucsd.edu/thredds/dap4/cdip/model/MOP_alongshore/OC400_forecast.nc.dmr.xml",
+      },
+      {
+        name: "HTTPServer NetCDF",
+        url: "https://thredds.cdip.ucsd.edu/thredds/fileServer/cdip/model/MOP_alongshore/OC400_forecast.nc",
+      },
+      {
+        name: "NCSS Point XML",
+        url: "https://thredds.cdip.ucsd.edu/thredds/ncss/point/cdip/model/MOP_alongshore/OC400_forecast.nc?latitude=33.59682846069336&longitude=-117.90316772460938&time_start=2026-03-17T00:00:00Z&time_end=2026-03-26T21:00:00Z&var=waveHs&var=waveTp&var=waveDp&accept=xml",
+      },
+      {
+        name: "CdmRemote Header",
+        url: "https://thredds.cdip.ucsd.edu/thredds/cdmremote/cdip/model/MOP_alongshore/OC400_forecast.nc?req=header",
+      },
+    ];
+
+    async function run() {
+      const output = [];
+      for (const entry of cases) {
+        try {
+          const response = await fetch(entry.url);
+          const contentType = response.headers.get("content-type");
+          const accessControl = response.headers.get("access-control-allow-origin");
+          const text = await response.text();
+          output.push({
+            name: entry.name,
+            ok: response.ok,
+            status: response.status,
+            type: response.type,
+            contentType,
+            accessControl,
+            bodySnippet: text.slice(0, 160),
+          });
+        } catch (error) {
+          output.push({
+            name: entry.name,
+            ok: false,
+            status: null,
+            type: "fetch-error",
+            errorName: error && error.name ? error.name : null,
+            errorMessage: error && error.message ? error.message : String(error),
+          });
+        }
+      }
+      document.getElementById("output").textContent = JSON.stringify(output, null, 2);
+    }
+
+    run();
+  </script>
+</body>
+</html>
