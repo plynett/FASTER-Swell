@@ -153,6 +153,7 @@ a.status-pill:hover {
   min-height: 860px;
   flex: 1;
   align-items: stretch;
+  align-content: start;
 }
 
 .manual-layout {
