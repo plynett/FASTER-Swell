@@ -118,7 +118,6 @@
             </label>
             <div class="button-cluster">
               <button id="resetDefaultsButton" class="ghost-button" type="button">Reset Defaults</button>
-              <button id="runModelButton" class="primary-button" type="button">RUN FASTER-SWELL</button>
             </div>
           </div>
         </div>
@@ -131,13 +130,13 @@
             <h2>Wave/Tide Panels</h2>
           </div>
           <div class="panel-actions">
-            <span class="status-pill subtle" id="runStatusPill">Awaiting run</span>
+            <span class="status-pill subtle" id="runStatusPill">Auto-loading</span>
           </div>
         </div>
 
         <div class="empty-state" id="forecastEmptyState">
-          <h3>No forecast has been run yet</h3>
-          <p>Select a transect, tune the geometry, and run the model. The app will request live MOP forecast data from CDIP and pair it with NOAA tides for playback.</p>
+          <h3>Loading forecast data...</h3>
+          <p>Select a transect to automatically load live MOP forecast data from CDIP and pair it with NOAA tides for playback.</p>
         </div>
 
         <div class="forecast-content hidden" id="forecastContent">
@@ -187,8 +186,8 @@
         </div>
 
         <div class="empty-state" id="runupEmptyState">
-          <h3>No runup profile available yet</h3>
-          <p>Run the model to project still water, crest, expected, conservative, and upper-bound runup levels across the selected transect.</p>
+          <h3>Preparing runup analysis...</h3>
+          <p>The selected transect updates automatically, and any beach profile edits refresh the projected still water, crest, expected, conservative, and upper-bound runup levels.</p>
         </div>
 
         <div class="runup-content hidden" id="runupContent">

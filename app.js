@@ -63,6 +63,7 @@ const state = {
   topRowHeightFrame: null,
   displayUnits: "metric",
   timeMode: "utc",
+  selectionRequestId: 0,
 };
 
 const dom = {
@@ -76,7 +77,6 @@ const dom = {
   geometryHelperText: document.getElementById("geometryHelperText"),
   unitModeControl: document.getElementById("unitModeControl"),
   timeModeControl: document.getElementById("timeModeControl"),
-  runModelButton: document.getElementById("runModelButton"),
   resetDefaultsButton: document.getElementById("resetDefaultsButton"),
   runStatusPill: document.getElementById("runStatusPill"),
   forecastEmptyState: document.getElementById("forecastEmptyState"),
@@ -228,7 +228,6 @@ async function init() {
   }
 
   await selectTransect(requestedTransect || demoTransect, { flyTo: Boolean(requestedTransect) });
-  await runModel();
   scheduleTopRowHeightCapture();
 
   setAppStatus("Prototype ready. Zoom in and click a transect to explore.");
@@ -351,19 +350,9 @@ function bindControls() {
       return;
     }
     applyModelParams(getDefaultsForTransect(state.selectedTransect.label));
-    setGeometryHelper("Defaults restored. Run the model to refresh the lower forecast panels.");
-  });
-
-  dom.runModelButton.addEventListener("click", () => {
-    runModel().catch((error) => {
-      console.error(error);
-      if (!dom.runStatusPill.textContent.toLowerCase().includes("failed")) {
-        dom.runStatusPill.textContent = "Run failed";
-      }
-      if (dom.geometryHelperText && !dom.geometryHelperText.textContent.toLowerCase().includes("failed")) {
-        setGeometryHelper("The model run failed. Check the browser console for details.");
-      }
-    });
+    if (state.selectedForecast && state.selectedTideSeries) {
+      refreshComputedResults();
+    }
   });
 
   dom.timeSlider.addEventListener("input", () => {
@@ -448,6 +437,8 @@ async function selectTransect(transect, options = {}) {
     return;
   }
 
+  const selectionRequestId = state.selectionRequestId + 1;
+  state.selectionRequestId = selectionRequestId;
   stopPlayback();
   state.selectedTransect = transect;
   state.selectedDatasetMeta = state.manifest.datasets[transect.label] || null;
@@ -466,16 +457,19 @@ async function selectTransect(transect, options = {}) {
   dom.dataAvailabilityPill.textContent = state.selectedDatasetMeta
     ? "Live MOP + fallback"
     : "Live MOP ready";
-  dom.runStatusPill.textContent = "Awaiting run";
+  dom.runStatusPill.textContent = "Loading forecast...";
   dom.forecastEmptyState.classList.remove("hidden");
   dom.forecastContent.classList.add("hidden");
   dom.timelineControls.classList.remove("hidden");
   dom.metricGrid.classList.remove("hidden");
   dom.runupEmptyState.classList.remove("hidden");
   dom.runupContent.classList.add("hidden");
-  dom.forecastEmptyState.querySelector("h3").textContent = "No forecast has been run yet";
+  dom.forecastEmptyState.querySelector("h3").textContent = `Loading ${transect.label} forecast...`;
   dom.forecastEmptyState.querySelector("p").textContent =
-    "Select a transect, tune the geometry, and run the model. The app will try live MOP forecast data first and fall back to local forecast files where available.";
+    "The app is requesting live MOP forecast data first and falling back to local forecast files where available.";
+  dom.runupEmptyState.querySelector("h3").textContent = "Preparing runup analysis...";
+  dom.runupEmptyState.querySelector("p").textContent =
+    "The selected transect updates automatically, and geometry edits will refresh the overtopping analysis.";
   dom.metricGrid.innerHTML = "";
   dom.runupProfile.innerHTML = "";
   dom.categoryPill.textContent = "--";
@@ -496,8 +490,15 @@ async function selectTransect(transect, options = {}) {
   }
 
   const tideStation = await resolveTideStation(transect);
+  if (isSelectionRequestStale(selectionRequestId, transect.label)) {
+    return;
+  }
   state.selectedTideStation = tideStation;
   dom.tideChartTitle.textContent = formatTideChartTitle(tideStation);
+  await runModel({
+    selectionRequestId,
+    tideStation,
+  });
 }
 
 function getRequestedTransectLabelFromLocation() {
@@ -547,12 +548,17 @@ function syncSelectedTransectUrl(transectLabel) {
   window.history.replaceState({ transect: transectLabel }, "", url.toString());
 }
 
-async function runModel() {
+function isSelectionRequestStale(selectionRequestId, transectLabel) {
+  return selectionRequestId !== state.selectionRequestId || state.selectedTransect?.label !== transectLabel;
+}
+
+async function runModel(options = {}) {
   if (!state.selectedTransect) {
     return;
   }
 
-  stopPlayback();
+  const selectionRequestId = options.selectionRequestId ?? state.selectionRequestId;
+  const transectLabel = state.selectedTransect.label;
   const params = sanitizeParams(readModelParamsFromInputs());
   applyModelParams(params);
   state.selectedForecast = null;
@@ -562,8 +568,15 @@ async function runModel() {
   dom.runStatusPill.textContent = "Loading forecast data...";
   setGeometryHelper("Preparing wave, tide, and runup data for the selected transect.");
 
-  const forecastDataset = await loadForecastDataset(state.selectedTransect.label);
-  const tideStation = state.selectedTideStation || (await resolveTideStation(state.selectedTransect));
+  const forecastDataset = await loadForecastDataset(transectLabel);
+  if (isSelectionRequestStale(selectionRequestId, transectLabel)) {
+    return;
+  }
+
+  const tideStation = options.tideStation || state.selectedTideStation || (await resolveTideStation(state.selectedTransect));
+  if (isSelectionRequestStale(selectionRequestId, transectLabel)) {
+    return;
+  }
   state.selectedTideStation = tideStation;
   const tideWindow = forecastDataset
     ? { startMs: forecastDataset.waveTimeMs[0], endMs: forecastDataset.waveTimeMs.at(-1) }
@@ -574,10 +587,16 @@ async function runModel() {
   let tideSeries;
   try {
     tideSeries = await loadTideSeries(tideStation.id, tideWindow.startMs, tideWindow.endMs);
+    if (isSelectionRequestStale(selectionRequestId, transectLabel)) {
+      return;
+    }
     state.selectedTideSeries = tideSeries;
   } catch (error) {
+    if (isSelectionRequestStale(selectionRequestId, transectLabel)) {
+      return;
+    }
     console.error("[FASTER NOAA] Tide download failed.", {
-      transect: state.selectedTransect.label,
+      transect: transectLabel,
       stationId: tideStation.id,
       stationName: tideStation.name,
       startMs: tideWindow.startMs,
@@ -591,7 +610,7 @@ async function runModel() {
 
   if (!forecastDataset) {
     console.info("[FASTER NOAA] Tide-only preview mode active because no live or local wave forecast was available.", {
-      transect: state.selectedTransect.label,
+      transect: transectLabel,
       stationId: tideStation.id,
       stationName: tideStation.name,
     });
@@ -621,24 +640,34 @@ async function runModel() {
   dom.dataAvailabilityPill.textContent = forecastDataset.sourceKind === "live"
     ? "Live forecast loaded"
     : "Local fallback forecast";
-  dom.runStatusPill.textContent = "Computing runup...";
   state.selectedForecast = forecastDataset;
-  state.results = forecastDataset.waveTimeMs.map((timeMs, index) => {
-    const tideLevel = findNearestTideLevel(tideSeries, timeMs) + params.tideSurgeLevel;
-    return computeRunupAtTime({
-      timeMs,
-      index,
-      waveHeightSwell: forecastDataset.waveHs[index],
-      waveHeightTotal: forecastDataset.waveHs[index] + params.waveTotalOffset,
-      peakWavePeriod: forecastDataset.waveTp[index],
-      waveDirection: forecastDataset.waveDp[index],
-      tideLevel,
-      waterDepthPrediction: forecastDataset.metaWaterDepth,
-      shorelineNormal: forecastDataset.metaShoreNormal ?? state.selectedTransect.shoreNormal,
-      params,
-    });
-  });
+  renderCharts(forecastDataset, tideSeries);
+  refreshComputedResults(sanitizeParams(readModelParamsFromInputs()));
+  scheduleTopRowHeightCapture();
+}
 
+function handleParameterInput() {
+  const params = sanitizeParams(readModelParamsFromInputs());
+  state.modelParams = params;
+  updateGeometryPreview();
+
+  if (state.selectedForecast && state.selectedTideSeries) {
+    refreshComputedResults(params);
+  }
+}
+
+function refreshComputedResults(params = state.modelParams || sanitizeParams(readModelParamsFromInputs())) {
+  if (!state.selectedTransect || !state.selectedForecast || !state.selectedTideSeries) {
+    return;
+  }
+
+  state.modelParams = { ...params };
+  state.results = computeRunupResults({
+    forecastDataset: state.selectedForecast,
+    tideSeries: state.selectedTideSeries,
+    params: state.modelParams,
+    transect: state.selectedTransect,
+  });
   state.resultsDirty = false;
   dom.forecastEmptyState.classList.add("hidden");
   dom.forecastContent.classList.remove("hidden");
@@ -653,21 +682,25 @@ async function runModel() {
   dom.timeSlider.max = String(Math.max(state.results.length - 1, 0));
   state.currentIndex = Math.max(playbackStartIndex, Math.min(state.currentIndex, state.results.length - 1));
   dom.timeSlider.value = String(state.currentIndex);
-
-  renderCharts(forecastDataset, tideSeries);
   updatePlaybackUI();
-  scheduleTopRowHeightCapture();
 }
 
-function handleParameterInput() {
-  const params = sanitizeParams(readModelParamsFromInputs());
-  state.modelParams = params;
-  updateGeometryPreview();
-
-  if (state.results) {
-    state.resultsDirty = true;
-    dom.runStatusPill.textContent = "Parameters changed";
-  }
+function computeRunupResults({ forecastDataset, tideSeries, params, transect }) {
+  return forecastDataset.waveTimeMs.map((timeMs, index) => {
+    const tideLevel = findNearestTideLevel(tideSeries, timeMs) + params.tideSurgeLevel;
+    return computeRunupAtTime({
+      timeMs,
+      index,
+      waveHeightSwell: forecastDataset.waveHs[index],
+      waveHeightTotal: forecastDataset.waveHs[index] + params.waveTotalOffset,
+      peakWavePeriod: forecastDataset.waveTp[index],
+      waveDirection: forecastDataset.waveDp[index],
+      tideLevel,
+      waterDepthPrediction: forecastDataset.metaWaterDepth,
+      shorelineNormal: forecastDataset.metaShoreNormal ?? transect.shoreNormal,
+      params,
+    });
+  });
 }
 
 function applyModelParams(params) {
