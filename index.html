@@ -86,8 +86,8 @@
 
           <div class="form-grid">
             <label class="field">
-              <span data-label-metric="Average Beach Slope [from 10m depth to shoreline]" data-label-english="Average Beach Slope [from 33 ft depth to shoreline]">Average Beach Slope [from 10m depth to shoreline]</span>
-              <input id="averageBeachSlopeInput" type="number" step="0.001" min="0.001">
+              <span data-label-metric="Average Beach-Face Slope over the Swash Zone" data-label-english="Average Beach-Face Slope over the Swash Zone">Average Beach-Face Slope over the Swash Zone</span>
+              <input id="averageBeachSlopeInput" type="number" step="0.001" min="0.001" title="Auto-estimated as twice the average MOP slope when available; edit if surveyed slope is available.">
             </label>
             <label class="field">
               <span data-label-metric="Beach Elevation at Dune/Structure Toe (m, MLLW)" data-label-english="Beach Elevation at Dune/Structure Toe (ft, MLLW)">Beach Elevation at Dune/Structure Toe (m, MLLW)</span>
@@ -112,10 +112,6 @@
           </div>
 
           <div class="toolbar-row">
-            <label class="field compact-field">
-              <span data-label-metric="Local Waves / Chop Height (m)" data-label-english="Local Waves / Chop Height (ft)">Local Waves / Chop Height (m)</span>
-              <input id="waveTotalOffsetInput" type="number" step="0.05" min="0">
-            </label>
             <div class="button-cluster">
               <button id="resetDefaultsButton" class="ghost-button" type="button">Reset Defaults</button>
             </div>
@@ -157,6 +153,15 @@
               </div>
               <div class="chart-canvas-frame">
                 <canvas id="tideChartCanvas"></canvas>
+              </div>
+            </div>
+            <div class="chart-panel">
+              <div class="chart-title-row">
+                <h3 id="windChartTitle">NWS Wind Forecast</h3>
+                <span>Speed / Chop</span>
+              </div>
+              <div class="chart-canvas-frame">
+                <canvas id="windChartCanvas"></canvas>
               </div>
             </div>
           </div>

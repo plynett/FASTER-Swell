@@ -5,6 +5,7 @@ const MAX_RENDERED_TRANSECTS = 1400;
 const NOAA_STATIONS_CSV_URL = "./data/noaa_ca_tide_stations.csv";
 const NOAA_STATIONS_URL = "https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi/stations.json?type=tidepredictions";
 const NOAA_PREDICTIONS_URL = "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter";
+const NWS_POINTS_BASE_URL = "https://api.weather.gov/points";
 const CDIP_DAP2_ASCII_BASE_URL = "https://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/model/MOP_alongshore";
 const CDIP_DAP2_ASCII_QUERY = "waveTime,waveHs,waveTp,waveDp,metaWaterDepth,metaShoreNormal";
 // Optional fallback API route provided by web/scripts/serve_faster_web.py when that proxy is running.
@@ -14,7 +15,26 @@ const TRANSECT_HIT_WEIGHT_MULTIPLIER = 3.2;
 const MIN_TRANSECT_HIT_WEIGHT = 9;
 const DEFAULT_TIDE_PREVIEW_HOURS = 240;
 const FEET_PER_METER = 3.28084;
+const MS_PER_MINUTE = 60 * 1000;
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
+const MPS_PER_KMH = 1 / 3.6;
+const SEA_LEVEL_ANOMALY_LOOKBACK_DAYS = 3;
+const SEA_LEVEL_ANOMALY_END_LAG_MINUTES = 60;
+const SEA_LEVEL_ANOMALY_INTERVAL_MINUTES = 6;
+const SEA_LEVEL_ANOMALY_MIN_PAIR_COUNT = 24;
+const SEA_LEVEL_ANOMALY_CACHE_TTL_MS = 15 * MS_PER_MINUTE;
+const SEA_LEVEL_ANOMALY_PAIR_TOLERANCE_MS = (SEA_LEVEL_ANOMALY_INTERVAL_MINUTES / 2) * MS_PER_MINUTE;
+const NWS_WIND_CACHE_TTL_MS = 30 * MS_PER_MINUTE;
+const MPH_PER_KMH = 0.621371;
+const GRAVITY_MPS2 = 9.81;
+const CHOP_PROXY_MAX_PERIOD_SECONDS = 4;
+const PM_CHOP_HEIGHT_COEFFICIENT = 0.241;
+const PM_PEAK_FREQUENCY_COEFFICIENT = 0.13;
+const PM_SHAPE_COEFFICIENT = 1.25;
+const MIN_AVERAGE_BEACH_SLOPE = 0.005;
+const MAX_AVERAGE_BEACH_SLOPE = 0.3;
+const DEFAULT_AVERAGE_BEACH_SLOPE = 0.05;
+const MOP_TO_SWASH_SLOPE_MULTIPLIER = 2;
 
 const COLORS = {
   navy: "#11314c",
@@ -42,9 +62,12 @@ const state = {
   selectedForecast: null,
   selectedTideStation: null,
   selectedTideSeries: null,
+  selectedWindSeries: null,
   currentTideWindow: null,
   tideStationsPromise: null,
   tideCache: new Map(),
+  seaLevelAnomalyCache: new Map(),
+  windCache: new Map(),
   datasetCache: new Map(),
   modelParams: null,
   results: null,
@@ -59,6 +82,7 @@ const state = {
   canvasRenderer: null,
   waveChart: null,
   tideChart: null,
+  windChart: null,
   lockedTopRowHeight: null,
   topRowHeightFrame: null,
   displayUnits: "metric",
@@ -85,8 +109,10 @@ const dom = {
   runupContent: document.getElementById("runupContent"),
   waveCanvas: document.getElementById("waveChartCanvas"),
   tideCanvas: document.getElementById("tideChartCanvas"),
+  windCanvas: document.getElementById("windChartCanvas"),
   waveChartTitle: document.getElementById("waveChartTitle"),
   tideChartTitle: document.getElementById("tideChartTitle"),
+  windChartTitle: document.getElementById("windChartTitle"),
   timeSlider: document.getElementById("timeSlider"),
   playPauseButton: document.getElementById("playPauseButton"),
   forecastWindowLabel: document.getElementById("forecastWindowLabel"),
@@ -100,7 +126,6 @@ const dom = {
   mapOverlayCard: document.getElementById("mapOverlayCard"),
   profileModeControl: document.getElementById("profileModeControl"),
   tideSurgeLevelInput: document.getElementById("tideSurgeLevelInput"),
-  waveTotalOffsetInput: document.getElementById("waveTotalOffsetInput"),
   averageBeachSlopeInput: document.getElementById("averageBeachSlopeInput"),
   beachElevationBaseInput: document.getElementById("beachElevationBaseInput"),
   bermWidthInput: document.getElementById("bermWidthInput"),
@@ -119,7 +144,6 @@ const numericInputIds = [
   "duneCrestElevationInput",
   "toeToCrestDistanceInput",
   "tideSurgeLevelInput",
-  "waveTotalOffsetInput",
 ];
 
 const currentTimeLinePlugin = {
@@ -349,7 +373,8 @@ function bindControls() {
     if (!state.selectedTransect) {
       return;
     }
-    applyModelParams(getDefaultsForTransect(state.selectedTransect.label));
+    applyModelParams(getDefaultsForTransect(state.selectedTransect));
+    syncAverageBeachSlopeInputTitle(state.selectedTransect);
     if (state.selectedForecast && state.selectedTideSeries) {
       refreshComputedResults();
     }
@@ -422,7 +447,7 @@ function refreshDisplayPresentation() {
   }
 
   if (state.selectedForecast && state.selectedTideSeries) {
-    renderCharts(state.selectedForecast, state.selectedTideSeries);
+    renderCharts(state.selectedForecast, state.selectedTideSeries, state.selectedWindSeries);
     updatePlaybackUI();
     return;
   }
@@ -446,6 +471,7 @@ async function selectTransect(transect, options = {}) {
   state.selectedForecast = null;
   state.currentIndex = 0;
   state.selectedTideSeries = null;
+  state.selectedWindSeries = null;
   state.currentTideWindow = null;
   state.resultsDirty = false;
   destroyForecastCharts();
@@ -454,6 +480,7 @@ async function selectTransect(transect, options = {}) {
   dom.selectionTitle.textContent = `Transect ${transect.label}`;
   dom.waveChartTitle.textContent = `MOP Wave Forecast - Transect ${transect.label}`;
   dom.tideChartTitle.textContent = "NOAA Tide Prediction";
+  dom.windChartTitle.textContent = "NWS Wind Forecast";
   dom.dataAvailabilityPill.textContent = state.selectedDatasetMeta
     ? "Live MOP + fallback"
     : "Live MOP ready";
@@ -477,8 +504,9 @@ async function selectTransect(transect, options = {}) {
   dom.categoryPill.style.color = "#7a5413";
   syncSelectedTransectUrl(transect.label);
 
-  const defaults = getDefaultsForTransect(transect.label);
+  const defaults = getDefaultsForTransect(transect);
   applyModelParams(defaults);
+  syncAverageBeachSlopeInputTitle(transect);
   updateGeometryPreview();
   applyTopRowHeightLock();
   syncVisibleTransects();
@@ -559,7 +587,7 @@ async function runModel(options = {}) {
 
   const selectionRequestId = options.selectionRequestId ?? state.selectionRequestId;
   const transectLabel = state.selectedTransect.label;
-  const params = sanitizeParams(readModelParamsFromInputs());
+  let params = sanitizeParams(readModelParamsFromInputs());
   applyModelParams(params);
   state.selectedForecast = null;
   state.results = null;
@@ -578,19 +606,78 @@ async function runModel(options = {}) {
     return;
   }
   state.selectedTideStation = tideStation;
+
+  dom.runStatusPill.textContent = "Estimating sea-level anomaly...";
+  dom.tideSurgeLevelInput.title = "Auto-estimating recent NOAA observed minus predicted water level residual.";
+  try {
+    const anomalyEstimate = await loadSeaLevelAnomalyEstimate(tideStation.id);
+    if (isSelectionRequestStale(selectionRequestId, transectLabel)) {
+      return;
+    }
+    params = sanitizeParams({
+      ...params,
+      tideSurgeLevel: anomalyEstimate.anomaly,
+    });
+    applyModelParams(params);
+    dom.tideSurgeLevelInput.title =
+      `Auto-estimated from ${anomalyEstimate.pairCount} NOAA observed-minus-predicted ` +
+      `water-level pairs at station ${tideStation.id}, ${formatNoaaDate(anomalyEstimate.startMs)} ` +
+      `to ${formatNoaaDate(anomalyEstimate.endMs)} UTC.`;
+    console.info("[FASTER NOAA] Auto-estimated sea-level anomaly.", {
+      stationId: tideStation.id,
+      stationName: tideStation.name,
+      anomalyMeters: anomalyEstimate.anomaly,
+      pairCount: anomalyEstimate.pairCount,
+      start: formatNoaaDate(anomalyEstimate.startMs),
+      end: formatNoaaDate(anomalyEstimate.endMs),
+    });
+  } catch (error) {
+    if (isSelectionRequestStale(selectionRequestId, transectLabel)) {
+      return;
+    }
+    dom.tideSurgeLevelInput.title = "Sea-level anomaly auto-estimate unavailable; using the current input value.";
+    console.warn("[FASTER NOAA] Sea-level anomaly estimate failed; using current input value.", {
+      stationId: tideStation.id,
+      stationName: tideStation.name,
+      error,
+    });
+  }
+
   const tideWindow = forecastDataset
     ? { startMs: forecastDataset.waveTimeMs[0], endMs: forecastDataset.waveTimeMs.at(-1) }
     : getDefaultTidePreviewWindow();
   state.currentTideWindow = tideWindow;
 
-  dom.runStatusPill.textContent = "Loading NOAA tides...";
+  dom.runStatusPill.textContent = forecastDataset ? "Loading NOAA tides and winds..." : "Loading NOAA tides...";
+  const windSeriesPromise = forecastDataset
+    ? loadWindForecastSeries(state.selectedTransect, tideWindow.startMs, tideWindow.endMs)
+      .then((windSeries) => ({ windSeries }))
+      .catch((error) => ({ error }))
+    : Promise.resolve({ windSeries: null });
   let tideSeries;
+  let windSeries = null;
   try {
     tideSeries = await loadTideSeries(tideStation.id, tideWindow.startMs, tideWindow.endMs);
     if (isSelectionRequestStale(selectionRequestId, transectLabel)) {
       return;
     }
     state.selectedTideSeries = tideSeries;
+    const windOutcome = await windSeriesPromise;
+    if (isSelectionRequestStale(selectionRequestId, transectLabel)) {
+      return;
+    }
+    if (windOutcome.error) {
+      state.selectedWindSeries = null;
+      console.warn("[FASTER NWS] Wind forecast load failed; wind subplot will be empty.", {
+        transect: transectLabel,
+        startMs: tideWindow.startMs,
+        endMs: tideWindow.endMs,
+        error: windOutcome.error,
+      });
+    } else {
+      windSeries = windOutcome.windSeries;
+      state.selectedWindSeries = windSeries;
+    }
   } catch (error) {
     if (isSelectionRequestStale(selectionRequestId, transectLabel)) {
       return;
@@ -641,7 +728,7 @@ async function runModel(options = {}) {
     ? "Live forecast loaded"
     : "Local fallback forecast";
   state.selectedForecast = forecastDataset;
-  renderCharts(forecastDataset, tideSeries);
+  renderCharts(forecastDataset, tideSeries, windSeries);
   refreshComputedResults(sanitizeParams(readModelParamsFromInputs()));
   scheduleTopRowHeightCapture();
 }
@@ -665,6 +752,7 @@ function refreshComputedResults(params = state.modelParams || sanitizeParams(rea
   state.results = computeRunupResults({
     forecastDataset: state.selectedForecast,
     tideSeries: state.selectedTideSeries,
+    windSeries: state.selectedWindSeries,
     params: state.modelParams,
     transect: state.selectedTransect,
   });
@@ -685,14 +773,16 @@ function refreshComputedResults(params = state.modelParams || sanitizeParams(rea
   updatePlaybackUI();
 }
 
-function computeRunupResults({ forecastDataset, tideSeries, params, transect }) {
+function computeRunupResults({ forecastDataset, tideSeries, windSeries, params, transect }) {
   return forecastDataset.waveTimeMs.map((timeMs, index) => {
     const tideLevel = findNearestTideLevel(tideSeries, timeMs) + params.tideSurgeLevel;
+    const localChopHeight = findIntervalValueAtTime(windSeries?.chopIntervals, timeMs, 0);
     return computeRunupAtTime({
       timeMs,
       index,
       waveHeightSwell: forecastDataset.waveHs[index],
-      waveHeightTotal: forecastDataset.waveHs[index] + params.waveTotalOffset,
+      localChopHeight,
+      waveHeightTotal: forecastDataset.waveHs[index] + localChopHeight,
       peakWavePeriod: forecastDataset.waveTp[index],
       waveDirection: forecastDataset.waveDp[index],
       tideLevel,
@@ -711,7 +801,6 @@ function applyModelParams(params) {
   dom.duneCrestElevationInput.value = formatDisplayInputValue(params.duneCrestElevation, 1);
   dom.toeToCrestDistanceInput.value = formatDisplayInputValue(params.toeToCrestDistance, 1);
   dom.tideSurgeLevelInput.value = formatDisplayInputValue(params.tideSurgeLevel, 2);
-  dom.waveTotalOffsetInput.value = formatDisplayInputValue(params.waveTotalOffset, 2);
   profileModeButtons.forEach((button) => button.classList.toggle("active", button.dataset.mode === params.profileMode));
   syncDisplayModeControls();
   updateUnitAwareLabels();
@@ -728,12 +817,16 @@ function readModelParamsFromInputs() {
     duneCrestElevation: parseDisplayInputLength(dom.duneCrestElevationInput.value),
     toeToCrestDistance: parseDisplayInputLength(dom.toeToCrestDistanceInput.value),
     tideSurgeLevel: parseDisplayInputLength(dom.tideSurgeLevelInput.value),
-    waveTotalOffset: parseDisplayInputLength(dom.waveTotalOffsetInput.value),
   };
 }
 
 function sanitizeParams(rawParams) {
-  const averageBeachSlope = clampNumber(rawParams.averageBeachSlope, 0.005, 0.3, 0.05);
+  const averageBeachSlope = clampNumber(
+    rawParams.averageBeachSlope,
+    MIN_AVERAGE_BEACH_SLOPE,
+    MAX_AVERAGE_BEACH_SLOPE,
+    DEFAULT_AVERAGE_BEACH_SLOPE
+  );
   const beachElevationBase = clampNumber(rawParams.beachElevationBase, -1, 12, 3.5);
   const bermWidth = clampNumber(rawParams.bermWidth, 0, 250, 0);
   const fallbackToeToCrestDistance = Number.isFinite(rawParams.duneWidth)
@@ -744,7 +837,6 @@ function sanitizeParams(rawParams) {
   const minCrest = beachElevationBase + 0.1;
   const duneCrestElevation = clampNumber(rawParams.duneCrestElevation, minCrest, 20, minCrest);
   const tideSurgeLevel = clampNumber(rawParams.tideSurgeLevel, -2, 4, 0);
-  const waveTotalOffset = clampNumber(rawParams.waveTotalOffset, 0, 4, 0.5);
 
   return {
     profileMode: rawParams.profileMode === "structure" ? "structure" : "dune",
@@ -755,18 +847,67 @@ function sanitizeParams(rawParams) {
     toeToCrestDistance,
     duneWidth,
     tideSurgeLevel,
-    waveTotalOffset,
   };
 }
 
-function getDefaultsForTransect(label) {
+function getDefaultsForTransect(transectOrLabel) {
+  const label = typeof transectOrLabel === "string" ? transectOrLabel : transectOrLabel?.label;
   const demoDefaults = state.manifest.datasets[label]?.defaults;
   const defaults = { ...(demoDefaults || state.genericDefaults) };
   const duneWidth = Number(defaults.duneWidth);
+  const slopeEstimate = typeof transectOrLabel === "string"
+    ? null
+    : estimateAverageBeachSlopeFromTransect(transectOrLabel);
   return {
     ...defaults,
+    averageBeachSlope: slopeEstimate?.slope ?? defaults.averageBeachSlope,
     toeToCrestDistance: Number.isFinite(duneWidth) ? duneWidth / 2 : 15,
   };
+}
+
+function estimateAverageBeachSlopeFromTransect(transect) {
+  const waterDepthMeters = Math.abs(Number(transect?.waterDepth));
+  const distanceKm = haversineKm(
+    Number(transect?.backbeachLat),
+    Number(transect?.backbeachLon),
+    Number(transect?.predictionLat),
+    Number(transect?.predictionLon)
+  );
+  const distanceMeters = distanceKm * 1000;
+  if (!Number.isFinite(waterDepthMeters) || waterDepthMeters <= 0 || !Number.isFinite(distanceMeters) || distanceMeters <= 0) {
+    return null;
+  }
+
+  const mopAverageSlope = waterDepthMeters / distanceMeters;
+  const swashSlopeProxy = MOP_TO_SWASH_SLOPE_MULTIPLIER * mopAverageSlope;
+  if (!Number.isFinite(swashSlopeProxy) || swashSlopeProxy <= 0) {
+    return null;
+  }
+
+  return {
+    slope: clamp(swashSlopeProxy, MIN_AVERAGE_BEACH_SLOPE, MAX_AVERAGE_BEACH_SLOPE),
+    mopAverageSlope,
+    swashSlopeProxy,
+    waterDepthMeters,
+    distanceMeters,
+  };
+}
+
+function syncAverageBeachSlopeInputTitle(transect) {
+  const estimate = estimateAverageBeachSlopeFromTransect(transect);
+  if (!estimate) {
+    dom.averageBeachSlopeInput.title = "Average beach-face slope over the swash zone; edit if surveyed profile data are available.";
+    return;
+  }
+
+  const clampedNote = Math.abs(estimate.slope - estimate.swashSlopeProxy) > 1e-6
+    ? ` Doubled proxy ${estimate.swashSlopeProxy.toFixed(3)} was limited to the model range.`
+    : "";
+  dom.averageBeachSlopeInput.title =
+    `Auto-estimated as 2 x MOP average slope: 2 x (${estimate.waterDepthMeters.toFixed(1)} m ` +
+    `prediction depth / ${estimate.distanceMeters.toFixed(0)} m backbeach-to-prediction distance) = ` +
+    `${estimate.swashSlopeProxy.toFixed(3)}.` +
+    `${clampedNote} Edit if surveyed beach slope is available.`;
 }
 
 function updateGeometryPreview() {
@@ -1258,6 +1399,313 @@ async function loadTideSeries(stationId, startMs, endMs) {
   return tideSeries;
 }
 
+async function loadWindForecastSeries(transect, startMs, endMs) {
+  const lat = Number(transect?.predictionLat);
+  const lon = Number(transect?.predictionLon);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+    throw new Error("Selected transect does not include a valid NWS wind forecast point.");
+  }
+
+  const cacheKey = `${lat.toFixed(4)},${lon.toFixed(4)}:${startMs}:${endMs}`;
+  const cached = state.windCache.get(cacheKey);
+  const nowMs = Date.now();
+  if (cached && cached.expiresAtMs > nowMs) {
+    return cached.series;
+  }
+
+  const pointUrl = `${NWS_POINTS_BASE_URL}/${lat.toFixed(4)},${lon.toFixed(4)}`;
+  const pointPayload = await fetchNwsJson(pointUrl);
+  const pointProperties = pointPayload.properties || {};
+  const gridUrl = pointProperties.forecastGridData;
+  if (!gridUrl) {
+    throw new Error("NWS point metadata did not include forecastGridData.");
+  }
+
+  const gridPayload = await fetchNwsJson(gridUrl);
+  const gridProperties = gridPayload.properties || {};
+  const windSpeedUnitCode = gridProperties.windSpeed?.uom || "";
+  const speedIntervals = parseNwsGridLayerIntervals(gridProperties.windSpeed, startMs, endMs)
+    .map((point) => ({
+      ...point,
+      value: normalizeNwsWindSpeedKmh(point.value, windSpeedUnitCode),
+    }))
+    .filter((point) => Number.isFinite(point.value));
+  const chopIntervals = speedIntervals.map((point) => ({
+    ...point,
+    value: estimateChopHeightMeters(point.value),
+  }));
+
+  const series = {
+    pointUrl,
+    gridUrl,
+    gridId: pointProperties.gridId || null,
+    gridX: pointProperties.gridX ?? null,
+    gridY: pointProperties.gridY ?? null,
+    forecastZone: pointProperties.forecastZone || null,
+    pointType: pointProperties.type || null,
+    updateTime: gridProperties.updateTime || null,
+    validTimes: gridProperties.validTimes || null,
+    chopIntervals,
+    speedPoints: buildIntervalStepPoints(speedIntervals),
+    chopPoints: buildIntervalStepPoints(chopIntervals),
+    speedIntervalCount: speedIntervals.length,
+    chopIntervalCount: chopIntervals.length,
+  };
+
+  console.info("[FASTER NWS] Loaded wind forecast grid data.", {
+    transect: transect.label,
+    grid: series.gridId ? `${series.gridId}/${series.gridX},${series.gridY}` : null,
+    pointType: series.pointType,
+    speedIntervals: series.speedIntervalCount,
+    chopIntervals: series.chopIntervalCount,
+    updateTime: series.updateTime,
+  });
+
+  state.windCache.set(cacheKey, {
+    series,
+    expiresAtMs: nowMs + NWS_WIND_CACHE_TTL_MS,
+  });
+  return series;
+}
+
+async function fetchNwsJson(url) {
+  const response = await fetch(url, {
+    headers: {
+      Accept: "application/geo+json",
+    },
+  });
+  if (!response.ok) {
+    throw new Error(`NWS request failed for ${url} with status ${response.status}`);
+  }
+  return response.json();
+}
+
+function parseNwsGridLayerIntervals(layer, windowStartMs, windowEndMs) {
+  return (layer?.values || [])
+    .map((row) => {
+      const interval = parseNwsValidTimeInterval(row.validTime);
+      const value = Number(row.value);
+      if (!interval || !Number.isFinite(value)) {
+        return null;
+      }
+      const start = Math.max(interval.startMs, windowStartMs);
+      const end = Math.min(interval.endMs, windowEndMs);
+      if (end < windowStartMs || start > windowEndMs || end <= start) {
+        return null;
+      }
+      return { startMs: start, endMs: end, value };
+    })
+    .filter(Boolean)
+    .sort((left, right) => left.startMs - right.startMs);
+}
+
+function parseNwsValidTimeInterval(validTime) {
+  if (typeof validTime !== "string") {
+    return null;
+  }
+
+  const [startText, durationText] = validTime.split("/");
+  const startMs = Date.parse(startText);
+  const durationMs = parseIsoDurationMs(durationText);
+  if (!Number.isFinite(startMs) || !Number.isFinite(durationMs)) {
+    return null;
+  }
+
+  return {
+    startMs,
+    endMs: startMs + durationMs,
+  };
+}
+
+function parseIsoDurationMs(durationText) {
+  if (typeof durationText !== "string") {
+    return NaN;
+  }
+
+  const match = durationText.match(
+    /^P(?:(\d+(?:\.\d+)?)D)?(?:T(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?)?$/
+  );
+  if (!match) {
+    return NaN;
+  }
+
+  const [, days = 0, hours = 0, minutes = 0, seconds = 0] = match;
+  return (
+    Number(days) * MS_PER_DAY +
+    Number(hours) * 60 * MS_PER_MINUTE +
+    Number(minutes) * MS_PER_MINUTE +
+    Number(seconds) * 1000
+  );
+}
+
+function normalizeNwsWindSpeedKmh(value, unitCode) {
+  if (!Number.isFinite(value)) {
+    return NaN;
+  }
+  if (unitCode.includes("km_h-1")) {
+    return value;
+  }
+  if (unitCode.includes("mi_h-1")) {
+    return value / MPH_PER_KMH;
+  }
+  if (unitCode.includes("m_s-1")) {
+    return value * 3.6;
+  }
+  if (unitCode.includes("kt")) {
+    return value * 1.852;
+  }
+  return value;
+}
+
+function estimateChopHeightMeters(windSpeedKmh) {
+  const windSpeedMps = Math.max(0, windSpeedKmh * MPS_PER_KMH);
+  if (windSpeedMps <= 0) {
+    return 0;
+  }
+
+  // Four-second Pierson-Moskowitz high-frequency-tail proxy from Chop Height Proxy Model.pdf.
+  const cutoffRatio = (PM_PEAK_FREQUENCY_COEFFICIENT * GRAVITY_MPS2 * CHOP_PROXY_MAX_PERIOD_SECONDS) / windSpeedMps;
+  const shortPeriodFraction = 1 - Math.exp(-PM_SHAPE_COEFFICIENT * cutoffRatio ** 4);
+  return PM_CHOP_HEIGHT_COEFFICIENT * (windSpeedMps ** 2 / GRAVITY_MPS2) * Math.sqrt(Math.max(shortPeriodFraction, 0));
+}
+
+function buildIntervalStepPoints(intervals) {
+  const points = [];
+  intervals.forEach((interval) => {
+    points.push({ x: interval.startMs, y: interval.value });
+    points.push({ x: interval.endMs, y: interval.value });
+  });
+  return points;
+}
+
+function findIntervalValueAtTime(intervals, targetMs, fallbackValue = null) {
+  if (!intervals?.length || !Number.isFinite(targetMs)) {
+    return fallbackValue;
+  }
+
+  const containingInterval = intervals.find((interval) => targetMs >= interval.startMs && targetMs <= interval.endMs);
+  return containingInterval ? containingInterval.value : fallbackValue;
+}
+
+async function loadSeaLevelAnomalyEstimate(stationId) {
+  const cached = state.seaLevelAnomalyCache.get(stationId);
+  const nowMs = Date.now();
+  if (cached && cached.expiresAtMs > nowMs) {
+    return cached.estimate;
+  }
+
+  const endMs = floorUtcTimeToMinuteInterval(
+    nowMs - SEA_LEVEL_ANOMALY_END_LAG_MINUTES * MS_PER_MINUTE,
+    SEA_LEVEL_ANOMALY_INTERVAL_MINUTES
+  );
+  const startMs = endMs - SEA_LEVEL_ANOMALY_LOOKBACK_DAYS * MS_PER_DAY;
+
+  const [observedSeries, predictedSeries] = await Promise.all([
+    loadNoaaWaterLevelSeries({
+      stationId,
+      product: "water_level",
+      startMs,
+      endMs,
+    }),
+    loadNoaaWaterLevelSeries({
+      stationId,
+      product: "predictions",
+      interval: String(SEA_LEVEL_ANOMALY_INTERVAL_MINUTES),
+      startMs,
+      endMs,
+    }),
+  ]);
+
+  const residuals = pairObservedAndPredictedResiduals(observedSeries, predictedSeries);
+  if (residuals.length < SEA_LEVEL_ANOMALY_MIN_PAIR_COUNT) {
+    throw new Error(`Only ${residuals.length} paired water-level residuals were available.`);
+  }
+
+  const estimate = {
+    stationId,
+    startMs,
+    endMs,
+    anomaly: mean(residuals),
+    pairCount: residuals.length,
+    observedCount: observedSeries.length,
+    predictedCount: predictedSeries.length,
+  };
+  state.seaLevelAnomalyCache.set(stationId, {
+    estimate,
+    expiresAtMs: nowMs + SEA_LEVEL_ANOMALY_CACHE_TTL_MS,
+  });
+  return estimate;
+}
+
+async function loadNoaaWaterLevelSeries({ stationId, product, interval, startMs, endMs }) {
+  const params = new URLSearchParams({
+    begin_date: formatNoaaDate(startMs),
+    end_date: formatNoaaDate(endMs),
+    station: stationId,
+    product,
+    datum: "MLLW",
+    units: "metric",
+    time_zone: "gmt",
+    format: "json",
+    application: NOAA_APPLICATION_ID,
+  });
+  if (interval) {
+    params.set("interval", interval);
+  }
+
+  const requestUrl = `${NOAA_PREDICTIONS_URL}?${params.toString()}`;
+  const response = await fetch(requestUrl);
+  if (!response.ok) {
+    throw new Error(`NOAA ${product} request failed with ${response.status}`);
+  }
+
+  const payload = await response.json();
+  const rows = product === "predictions" ? payload.predictions : payload.data;
+  if (!rows) {
+    throw new Error(payload.error?.message || `NOAA ${product} payload did not include data.`);
+  }
+
+  return rows
+    .map((row) => ({
+      timeMs: Date.parse(`${row.t}Z`),
+      level: Number(row.v),
+    }))
+    .filter((point) => Number.isFinite(point.timeMs) && Number.isFinite(point.level))
+    .sort((left, right) => left.timeMs - right.timeMs);
+}
+
+function pairObservedAndPredictedResiduals(observedSeries, predictedSeries) {
+  const predictedByTime = new Map(predictedSeries.map((point) => [point.timeMs, point.level]));
+  const residuals = [];
+
+  observedSeries.forEach((observedPoint) => {
+    const exactPrediction = predictedByTime.get(observedPoint.timeMs);
+    const predictedLevel = Number.isFinite(exactPrediction)
+      ? exactPrediction
+      : findNearestLevelWithin(predictedSeries, observedPoint.timeMs, SEA_LEVEL_ANOMALY_PAIR_TOLERANCE_MS);
+    if (Number.isFinite(predictedLevel)) {
+      residuals.push(observedPoint.level - predictedLevel);
+    }
+  });
+
+  return residuals;
+}
+
+function findNearestLevelWithin(series, targetMs, toleranceMs) {
+  let bestLevel = null;
+  let bestDelta = Number.POSITIVE_INFINITY;
+
+  series.forEach((point) => {
+    const delta = Math.abs(point.timeMs - targetMs);
+    if (delta < bestDelta) {
+      bestDelta = delta;
+      bestLevel = point.level;
+    }
+  });
+
+  return bestDelta <= toleranceMs ? bestLevel : null;
+}
+
 function findNearestTideLevel(tideSeries, targetMs) {
   if (!tideSeries.timeMs.length) {
     return 0;
@@ -1357,6 +1805,7 @@ function computeRunupAtTime(input) {
     timeMs: input.timeMs,
     tideLevel: input.tideLevel,
     waveHeightSwell: input.waveHeightSwell,
+    localChopHeight: input.localChopHeight,
     waveHeightTotal: input.waveHeightTotal,
     peakWavePeriod: input.peakWavePeriod,
     waveDirection: input.waveDirection,
@@ -1453,6 +1902,10 @@ function destroyForecastCharts() {
     state.tideChart.destroy();
     state.tideChart = null;
   }
+  if (state.windChart) {
+    state.windChart.destroy();
+    state.windChart = null;
+  }
 }
 
 function renderTideOnlyPreview(tideSeries, tideWindow) {
@@ -1462,6 +1915,7 @@ function renderTideOnlyPreview(tideSeries, tideWindow) {
 
   dom.waveChartTitle.textContent = `MOP Wave Forecast - Transect ${state.selectedTransect.label}`;
   dom.tideChartTitle.textContent = formatTideChartTitle(state.selectedTideStation || { id: tideSeries.stationId });
+  dom.windChartTitle.textContent = "NWS Wind Forecast";
 
   destroyForecastCharts();
 
@@ -1563,18 +2017,62 @@ function renderTideOnlyPreview(tideSeries, tideWindow) {
     },
   });
 
+  state.windChart = new Chart(dom.windCanvas, {
+    type: "line",
+    data: { datasets: [] },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      layout: { padding: { top: 0, right: 4, bottom: 0, left: 2 } },
+      plugins: {
+        legend: { display: false },
+        tooltip: { enabled: false },
+        emptyStateMessage: {
+          message: "Wind forecast will load with a MOP forecast window.",
+        },
+      },
+      scales: {
+        x: {
+          type: "time",
+          min: timeMin,
+          max: timeMax,
+          time: { unit: "day" },
+          ticks: { callback: (value) => formatAxisDate(Number(value)) },
+          grid: { color: "rgba(17,49,76,0.08)" },
+        },
+        ySpeed: {
+          min: 0,
+          display: false,
+          grid: { display: false },
+          border: { display: false },
+        },
+        yChop: {
+          position: "right",
+          min: 0,
+          display: false,
+          grid: { display: false },
+          border: { display: false },
+        },
+      },
+    },
+  });
+
   dom.forecastWindowLabel.textContent = `${formatShortDateTime(timeMin)} to ${formatShortDateTime(timeMax)} ${getTimeModeLabel()}`;
 }
 
-function renderCharts(forecastDataset, tideSeries) {
+function renderCharts(forecastDataset, tideSeries, windSeries = null) {
   const wavePoints = forecastDataset.waveTimeMs.map((timeMs, index) => ({ x: timeMs, y: convertElevationForDisplay(forecastDataset.waveHs[index]) }));
   const periodPoints = forecastDataset.waveTimeMs.map((timeMs, index) => ({ x: timeMs, y: forecastDataset.waveTp[index] }));
   const tidePoints = tideSeries.timeMs.map((timeMs, index) => ({ x: timeMs, y: convertElevationForDisplay(tideSeries.level[index]) }));
+  const windSpeedPoints = (windSeries?.speedPoints || []).map((point) => ({ x: point.x, y: convertWindSpeedForDisplay(point.y) }));
+  const chopPoints = (windSeries?.chopPoints || []).map((point) => ({ x: point.x, y: convertLengthForDisplay(point.y) }));
+  const hasWindData = Boolean(windSpeedPoints.length || chopPoints.length);
   const timeMin = getPlaybackStartTime(forecastDataset.waveTimeMs, forecastDataset.waveTimeMs[0]);
   const timeMax = forecastDataset.waveTimeMs.at(-1);
 
   dom.waveChartTitle.textContent = `MOP Wave Forecast - Transect ${state.selectedTransect.label}`;
   dom.tideChartTitle.textContent = formatTideChartTitle(state.selectedTideStation || { id: tideSeries.stationId });
+  dom.windChartTitle.textContent = formatWindChartTitle(windSeries);
 
   destroyForecastCharts();
 
@@ -1716,6 +2214,92 @@ function renderCharts(forecastDataset, tideSeries) {
     },
   });
 
+  state.windChart = new Chart(dom.windCanvas, {
+    type: "line",
+    data: {
+      datasets: hasWindData
+        ? [
+          {
+            label: `Wind Speed (${getWindSpeedUnitLabel()})`,
+            data: windSpeedPoints,
+            borderColor: COLORS.goldDeep,
+            backgroundColor: "rgba(215,167,79,0.14)",
+            borderWidth: 2.5,
+            pointRadius: 0,
+            stepped: true,
+            yAxisID: "ySpeed",
+          },
+          {
+            label: `Chop Height (${state.displayUnits === "english" ? "ft" : "m"})`,
+            data: chopPoints,
+            borderColor: COLORS.navy,
+            borderDash: [6, 5],
+            borderWidth: 2.3,
+            pointRadius: 0,
+            stepped: true,
+            yAxisID: "yChop",
+          },
+        ]
+        : [],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      layout: { padding: { top: 0, right: 4, bottom: 0, left: 2 } },
+      interaction: { mode: "index", intersect: false },
+      plugins: {
+        legend: { display: false },
+        tooltip: { callbacks: { title: tooltipTimeTitle } },
+        currentTimeLine: { value: state.results?.[state.currentIndex]?.timeMs, color: COLORS.aqua },
+        emptyStateMessage: {
+          message: "NWS wind forecast was unavailable for this forecast window.",
+        },
+      },
+      scales: {
+        x: {
+          type: "time",
+          min: timeMin,
+          max: timeMax,
+          time: { unit: "day" },
+          ticks: { callback: (value) => formatAxisDate(Number(value)) },
+          grid: { color: "rgba(17,49,76,0.08)" },
+        },
+        ySpeed: {
+          position: "left",
+          beginAtZero: true,
+          title: {
+            display: true,
+            text: ["Wind Speed", `(${getWindSpeedUnitLabel()})`],
+            color: COLORS.goldDeep,
+          },
+          ticks: { color: COLORS.goldDeep },
+          border: { color: COLORS.goldDeep },
+          grid: { color: "rgba(17,49,76,0.08)" },
+          afterFit(axis) {
+            axis.width = FIXED_AXIS_WIDTH;
+          },
+        },
+        yChop: {
+          position: "right",
+          min: 0,
+          title: {
+            display: true,
+            text: ["Chop Height", state.displayUnits === "english" ? "(ft)" : "(m)"],
+            color: COLORS.navy,
+          },
+          ticks: {
+            color: COLORS.navy,
+          },
+          border: { color: COLORS.navy },
+          grid: { drawOnChartArea: false },
+          afterFit(axis) {
+            axis.width = FIXED_AXIS_WIDTH;
+          },
+        },
+      },
+    },
+  });
+
   dom.forecastWindowLabel.textContent = `${formatShortDateTime(forecastDataset.waveTimeMs[0])} to ${formatShortDateTime(forecastDataset.waveTimeMs.at(-1))} ${getTimeModeLabel()}`;
 }
 
@@ -1739,6 +2323,7 @@ function updatePlaybackUI() {
 
   dom.metricGrid.innerHTML = [
     makeMetricCard("Wave Hs", formatDisplayLength(current.waveHeightSwell, 2)),
+    makeMetricCard("Local Chop", formatDisplayLength(current.localChopHeight, 2)),
     makeMetricCard("Peak Period", `${current.peakWavePeriod.toFixed(1)} s`),
     makeMetricCard("Tide + Anomaly", formatDisplayLength(current.tideLevel, 2)),
     makeMetricCard("Max Crest", formatDisplayLength(current.maxCrest, 2)),
@@ -1771,11 +2356,17 @@ function updatePlaybackUI() {
   dom.categoryPill.style.color = worstCategory.color;
   dom.playPauseButton.textContent = state.isPlaying ? "Pause" : "Play";
 
-  if (state.waveChart && state.tideChart) {
+  if (state.waveChart) {
     state.waveChart.options.plugins.currentTimeLine.value = current.timeMs;
-    state.tideChart.options.plugins.currentTimeLine.value = current.timeMs;
     state.waveChart.update("none");
+  }
+  if (state.tideChart) {
+    state.tideChart.options.plugins.currentTimeLine.value = current.timeMs;
     state.tideChart.update("none");
+  }
+  if (state.windChart) {
+    state.windChart.options.plugins.currentTimeLine.value = current.timeMs;
+    state.windChart.update("none");
   }
 }
 
@@ -2211,6 +2802,13 @@ function formatNoaaDate(timeMs) {
   return `${year}-${month}-${day} ${hours}:${minutes}`;
 }
 
+function floorUtcTimeToMinuteInterval(timeMs, intervalMinutes) {
+  const date = new Date(timeMs);
+  const minutes = date.getUTCMinutes();
+  date.setUTCMinutes(minutes - (minutes % intervalMinutes), 0, 0);
+  return date.getTime();
+}
+
 function convertLengthForDisplay(valueMeters) {
   return state.displayUnits === "english" ? valueMeters * FEET_PER_METER : valueMeters;
 }
@@ -2221,6 +2819,14 @@ function convertDistanceForDisplay(valueMeters) {
 
 function convertElevationForDisplay(valueMeters) {
   return convertLengthForDisplay(valueMeters);
+}
+
+function convertWindSpeedForDisplay(valueKmh) {
+  return state.displayUnits === "english" ? valueKmh * MPH_PER_KMH : valueKmh;
+}
+
+function getWindSpeedUnitLabel() {
+  return state.displayUnits === "english" ? "mph" : "km/h";
 }
 
 function parseDisplayInputLength(rawValue) {
@@ -2238,6 +2844,13 @@ function formatDisplayInputValue(valueMeters, digits = 1) {
 
 function formatDisplayLength(valueMeters, digits = 2) {
   return `${convertLengthForDisplay(valueMeters).toFixed(digits)} ${state.displayUnits === "english" ? "ft" : "m"}`;
+}
+
+function formatWindChartTitle(windSeries) {
+  if (windSeries?.gridId && windSeries.gridX !== null && windSeries.gridY !== null) {
+    return `NWS Wind Forecast - ${windSeries.gridId}/${windSeries.gridX},${windSeries.gridY}`;
+  }
+  return "NWS Wind Forecast";
 }
 
 function getDistanceAxisLabel() {
