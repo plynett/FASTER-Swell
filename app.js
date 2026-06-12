@@ -1,11 +1,17 @@
 const DEMO_LABEL = "OC400";
 const TRANSECT_QUERY_PARAM = "transect";
+const START_DATE_QUERY_PARAM = "start_date";
 const TRANSECT_ZOOM_THRESHOLD = 9;
 const MAX_RENDERED_TRANSECTS = 1400;
 const NOAA_STATIONS_CSV_URL = "./data/noaa_ca_tide_stations.csv";
+const KNOWN_TRANSECTS_CSV_URL = "./data/known_transects.csv";
+const PIER_TRANSECTS_BASE_URL = "./data/pier_transects";
 const NOAA_STATIONS_URL = "https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi/stations.json?type=tidepredictions";
 const NOAA_PREDICTIONS_URL = "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter";
+const NOAA_VERTICAL_DATUM = "NAVD";
+const DISPLAY_VERTICAL_DATUM = "NAVD88";
 const NWS_POINTS_BASE_URL = "https://api.weather.gov/points";
+const OPEN_METEO_HISTORICAL_URL = "https://archive-api.open-meteo.com/v1/archive";
 const CDIP_DAP2_ASCII_BASE_URL = "https://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/model/MOP_alongshore";
 const CDIP_DAP2_ASCII_QUERY = "waveTime,waveHs,waveTp,waveDp,metaWaterDepth,metaShoreNormal";
 // Optional fallback API route provided by web/scripts/serve_faster_web.py when that proxy is running.
@@ -16,6 +22,7 @@ const MIN_TRANSECT_HIT_WEIGHT = 9;
 const DEFAULT_TIDE_PREVIEW_HOURS = 240;
 const FEET_PER_METER = 3.28084;
 const MS_PER_MINUTE = 60 * 1000;
+const MS_PER_HOUR = 60 * MS_PER_MINUTE;
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 const MPS_PER_KMH = 1 / 3.6;
 const SEA_LEVEL_ANOMALY_LOOKBACK_DAYS = 3;
@@ -35,6 +42,13 @@ const MIN_AVERAGE_BEACH_SLOPE = 0.005;
 const MAX_AVERAGE_BEACH_SLOPE = 0.3;
 const DEFAULT_AVERAGE_BEACH_SLOPE = 0.05;
 const MOP_TO_SWASH_SLOPE_MULTIPLIER = 2;
+const MAX_WAVE_RATIO = 1.3;
+const CREST_RATIO = 0.55;
+const HINDCAST_WINDOW_DAYS = 5;
+const HINDCAST_END_SAFETY_LAG_HOURS = 6;
+const CDIP_HINDCAST_START_MS = Date.UTC(2000, 0, 1, 0, 0, 0);
+const CDIP_HINDCAST_END_MS = Date.UTC(2025, 2, 31, 23, 0, 0);
+const CDIP_NOWCAST_START_MS = Date.UTC(2025, 3, 1, 0, 0, 0);
 
 const COLORS = {
   navy: "#11314c",
@@ -47,6 +61,7 @@ const COLORS = {
   red: "#cc4b37",
   yellow: "#c6a023",
   black: "#1f2937",
+  pierDeck: "#5b3a1e",
   sand: "#f4b066",
   sandEdge: "#d88a39",
   water: "#9ed8ea",
@@ -57,17 +72,21 @@ const state = {
   manifest: null,
   transects: [],
   genericDefaults: null,
+  knownTransectProfiles: new Map(),
+  hindcastWindow: null,
   selectedTransect: null,
   selectedDatasetMeta: null,
   selectedForecast: null,
   selectedTideStation: null,
   selectedTideSeries: null,
   selectedWindSeries: null,
+  selectedPierTransect: null,
   currentTideWindow: null,
   tideStationsPromise: null,
   tideCache: new Map(),
   seaLevelAnomalyCache: new Map(),
   windCache: new Map(),
+  pierTransectCache: new Map(),
   datasetCache: new Map(),
   modelParams: null,
   results: null,
@@ -85,8 +104,8 @@ const state = {
   windChart: null,
   lockedTopRowHeight: null,
   topRowHeightFrame: null,
-  displayUnits: "metric",
-  timeMode: "utc",
+  displayUnits: "english",
+  timeMode: "local",
   selectionRequestId: 0,
 };
 
@@ -229,14 +248,17 @@ init().catch((error) => {
 async function init() {
   setAppStatus("Loading transects, manifests, and NOAA station metadata...");
 
-  const [manifest, transectPayload] = await Promise.all([
+  const [manifest, transectPayload, knownTransectsCsv] = await Promise.all([
     fetchJSON("./data/forecast-manifest.json"),
     fetchJSON("./data/transects.json"),
+    fetchOptionalText(KNOWN_TRANSECTS_CSV_URL),
   ]);
 
   state.manifest = manifest;
   state.transects = transectPayload.transects;
   state.genericDefaults = manifest.genericDefaults || transectPayload.genericDefaults;
+  state.knownTransectProfiles = parseKnownTransectProfiles(knownTransectsCsv);
+  state.hindcastWindow = getHindcastWindowFromLocation();
   state.tideStationsPromise = fetchCaliforniaTideStations();
 
   initMap();
@@ -254,7 +276,11 @@ async function init() {
   await selectTransect(requestedTransect || demoTransect, { flyTo: Boolean(requestedTransect) });
   scheduleTopRowHeightCapture();
 
-  setAppStatus("Prototype ready. Zoom in and click a transect to explore.");
+  setAppStatus(
+    state.hindcastWindow
+      ? `Hindcast ready for ${state.hindcastWindow.label}. Zoom in and click a transect to explore.`
+      : "Prototype ready. Zoom in and click a transect to explore."
+  );
 }
 
 function scheduleTopRowHeightCapture() {
@@ -472,6 +498,7 @@ async function selectTransect(transect, options = {}) {
   state.currentIndex = 0;
   state.selectedTideSeries = null;
   state.selectedWindSeries = null;
+  state.selectedPierTransect = null;
   state.currentTideWindow = null;
   state.resultsDirty = false;
   destroyForecastCharts();
@@ -481,9 +508,11 @@ async function selectTransect(transect, options = {}) {
   dom.waveChartTitle.textContent = `MOP Wave Forecast - Transect ${transect.label}`;
   dom.tideChartTitle.textContent = "NOAA Tide Prediction";
   dom.windChartTitle.textContent = "NWS Wind Forecast";
-  dom.dataAvailabilityPill.textContent = state.selectedDatasetMeta
-    ? "Live MOP + fallback"
-    : "Live MOP ready";
+  dom.dataAvailabilityPill.textContent = state.hindcastWindow
+    ? "CDIP hindcast ready"
+    : state.selectedDatasetMeta
+      ? "Live MOP + fallback"
+      : "Live MOP ready";
   dom.runStatusPill.textContent = "Loading forecast...";
   dom.forecastEmptyState.classList.remove("hidden");
   dom.forecastContent.classList.add("hidden");
@@ -493,7 +522,9 @@ async function selectTransect(transect, options = {}) {
   dom.runupContent.classList.add("hidden");
   dom.forecastEmptyState.querySelector("h3").textContent = `Loading ${transect.label} forecast...`;
   dom.forecastEmptyState.querySelector("p").textContent =
-    "The app is requesting live MOP forecast data first and falling back to local forecast files where available.";
+    state.hindcastWindow
+      ? formatHindcastLoadingMessage(state.hindcastWindow)
+      : "The app is requesting live MOP forecast data first and falling back to local forecast files where available.";
   dom.runupEmptyState.querySelector("h3").textContent = "Preparing runup analysis...";
   dom.runupEmptyState.querySelector("p").textContent =
     "The selected transect updates automatically, and geometry edits will refresh the overtopping analysis.";
@@ -549,6 +580,102 @@ function getRequestedTransectLabelFromLocation() {
   return normalizeTransectLabel(rawHash);
 }
 
+function getHindcastWindowFromLocation() {
+  const url = new URL(window.location.href);
+  const rawStartDate = getQueryOrHashParam(url, START_DATE_QUERY_PARAM);
+  if (!rawStartDate) {
+    return null;
+  }
+
+  const startMs = parseMmddyyyyUtc(rawStartDate);
+  if (!Number.isFinite(startMs)) {
+    console.warn("[FASTER Hindcast] Ignoring invalid start_date query parameter.", {
+      startDate: rawStartDate,
+      expectedFormat: "MMDDYYYY",
+    });
+    return null;
+  }
+
+  const requestedEndMs = startMs + HINDCAST_WINDOW_DAYS * MS_PER_DAY;
+  const endMs = getHistoricalOnlyHindcastEndMs(startMs);
+  if (endMs <= startMs) {
+    console.warn("[FASTER Hindcast] Ignoring start_date because it has no complete historical window yet.", {
+      startDate: rawStartDate,
+      start: new Date(startMs).toISOString(),
+      latestHistoricalEnd: new Date(endMs).toISOString(),
+    });
+    return null;
+  }
+
+  return {
+    rawStartDate,
+    startMs,
+    requestedEndMs,
+    endMs,
+    isClippedToHistoricalNow: endMs < requestedEndMs,
+    label: formatHindcastWindowLabel(startMs, endMs),
+  };
+}
+
+function getHistoricalOnlyHindcastEndMs(startMs) {
+  const requestedEndMs = startMs + HINDCAST_WINDOW_DAYS * MS_PER_DAY;
+  const latestHistoricalHourMs =
+    floorUtcTimeToHour(Date.now()) - HINDCAST_END_SAFETY_LAG_HOURS * MS_PER_HOUR;
+  return Math.min(requestedEndMs, latestHistoricalHourMs);
+}
+
+function formatHindcastWindowLabel(startMs, endMs) {
+  return `${formatIsoDate(startMs)} to ${formatIsoDate(endMs)}`;
+}
+
+function formatHindcastLoadingMessage(hindcastWindow) {
+  const windowText =
+    `${formatShortUtcDateTime(hindcastWindow.startMs)} to ` +
+    `${formatShortUtcDateTime(hindcastWindow.endMs)} UTC`;
+  if (hindcastWindow.isClippedToHistoricalNow) {
+    return `The app is requesting a CDIP MOP hindcast/nowcast window from ${windowText}, clipped before the current time.`;
+  }
+  return `The app is requesting a ${HINDCAST_WINDOW_DAYS}-day CDIP MOP hindcast/nowcast window from ${windowText}.`;
+}
+
+function getQueryOrHashParam(url, paramName) {
+  const directValue = url.searchParams.get(paramName);
+  if (directValue) {
+    return directValue;
+  }
+
+  const rawHash = url.hash.replace(/^#/, "").trim();
+  if (!rawHash || !rawHash.includes("=")) {
+    return null;
+  }
+
+  const hashParams = new URLSearchParams(rawHash.startsWith("?") ? rawHash.slice(1) : rawHash);
+  return hashParams.get(paramName);
+}
+
+function parseMmddyyyyUtc(value) {
+  const text = String(value || "").trim();
+  const match = text.match(/^(\d{2})(\d{2})(\d{4})$/);
+  if (!match) {
+    return NaN;
+  }
+
+  const [, monthText, dayText, yearText] = match;
+  const month = Number(monthText);
+  const day = Number(dayText);
+  const year = Number(yearText);
+  const dateMs = Date.UTC(year, month - 1, day, 0, 0, 0);
+  const date = new Date(dateMs);
+  if (
+    date.getUTCFullYear() !== year ||
+    date.getUTCMonth() !== month - 1 ||
+    date.getUTCDate() !== day
+  ) {
+    return NaN;
+  }
+  return dateMs;
+}
+
 function normalizeTransectLabel(value) {
   if (typeof value !== "string") {
     return null;
@@ -592,7 +719,7 @@ async function runModel(options = {}) {
   state.selectedForecast = null;
   state.results = null;
 
-  dom.dataAvailabilityPill.textContent = "Loading live MOP...";
+  dom.dataAvailabilityPill.textContent = state.hindcastWindow ? "Loading CDIP hindcast..." : "Loading live MOP...";
   dom.runStatusPill.textContent = "Loading forecast data...";
   setGeometryHelper("Preparing wave, tide, and runup data for the selected transect.");
 
@@ -607,10 +734,21 @@ async function runModel(options = {}) {
   }
   state.selectedTideStation = tideStation;
 
+  const tideWindow = forecastDataset
+    ? { startMs: forecastDataset.waveTimeMs[0], endMs: forecastDataset.waveTimeMs.at(-1) }
+    : getDefaultTidePreviewWindow();
+  state.currentTideWindow = tideWindow;
+
   dom.runStatusPill.textContent = "Estimating sea-level anomaly...";
-  dom.tideSurgeLevelInput.title = "Auto-estimating recent NOAA observed minus predicted water level residual.";
+  dom.tideSurgeLevelInput.title =
+    state.hindcastWindow
+      ? `Auto-estimating historical NOAA observed minus predicted water level residual in ${DISPLAY_VERTICAL_DATUM}.`
+      : `Auto-estimating recent NOAA observed minus predicted water level residual in ${DISPLAY_VERTICAL_DATUM}.`;
   try {
-    const anomalyEstimate = await loadSeaLevelAnomalyEstimate(tideStation.id);
+    const anomalyEstimate = await loadSeaLevelAnomalyEstimate(
+      tideStation.id,
+      state.hindcastWindow ? tideWindow : null
+    );
     if (isSelectionRequestStale(selectionRequestId, transectLabel)) {
       return;
     }
@@ -621,7 +759,7 @@ async function runModel(options = {}) {
     applyModelParams(params);
     dom.tideSurgeLevelInput.title =
       `Auto-estimated from ${anomalyEstimate.pairCount} NOAA observed-minus-predicted ` +
-      `water-level pairs at station ${tideStation.id}, ${formatNoaaDate(anomalyEstimate.startMs)} ` +
+      `${DISPLAY_VERTICAL_DATUM} water-level pairs at station ${tideStation.id}, ${formatNoaaDate(anomalyEstimate.startMs)} ` +
       `to ${formatNoaaDate(anomalyEstimate.endMs)} UTC.`;
     console.info("[FASTER NOAA] Auto-estimated sea-level anomaly.", {
       stationId: tideStation.id,
@@ -643,14 +781,17 @@ async function runModel(options = {}) {
     });
   }
 
-  const tideWindow = forecastDataset
-    ? { startMs: forecastDataset.waveTimeMs[0], endMs: forecastDataset.waveTimeMs.at(-1) }
-    : getDefaultTidePreviewWindow();
-  state.currentTideWindow = tideWindow;
-
-  dom.runStatusPill.textContent = forecastDataset ? "Loading NOAA tides and winds..." : "Loading NOAA tides...";
+  dom.runStatusPill.textContent = forecastDataset
+    ? state.hindcastWindow
+      ? "Loading NOAA tides and historical winds..."
+      : "Loading NOAA tides and winds..."
+    : "Loading NOAA tides...";
   const windSeriesPromise = forecastDataset
-    ? loadWindForecastSeries(state.selectedTransect, tideWindow.startMs, tideWindow.endMs)
+    ? state.hindcastWindow
+      ? loadHistoricalWindSeries(state.selectedTransect, tideWindow.startMs, tideWindow.endMs)
+      .then((windSeries) => ({ windSeries }))
+      .catch((error) => ({ error }))
+      : loadWindForecastSeries(state.selectedTransect, tideWindow.startMs, tideWindow.endMs)
       .then((windSeries) => ({ windSeries }))
       .catch((error) => ({ error }))
     : Promise.resolve({ windSeries: null });
@@ -667,9 +808,13 @@ async function runModel(options = {}) {
       return;
     }
     if (windOutcome.error) {
-      state.selectedWindSeries = null;
-      console.warn("[FASTER NWS] Wind forecast load failed; wind subplot will be empty.", {
+      windSeries = state.hindcastWindow
+        ? createHistoricalWindUnavailableSeries(tideWindow, "Historical wind request failed; hindcast chop is set to 0.")
+        : null;
+      state.selectedWindSeries = windSeries;
+      console.warn("[FASTER Wind] Wind data load failed; wind subplot will be empty.", {
         transect: transectLabel,
+        source: state.hindcastWindow ? "historical" : "forecast",
         startMs: tideWindow.startMs,
         endMs: tideWindow.endMs,
         error: windOutcome.error,
@@ -724,10 +869,19 @@ async function runModel(options = {}) {
     return;
   }
 
-  dom.dataAvailabilityPill.textContent = forecastDataset.sourceKind === "live"
-    ? "Live forecast loaded"
-    : "Local fallback forecast";
+  dom.dataAvailabilityPill.textContent =
+    forecastDataset.sourceKind === "live"
+      ? "Live forecast loaded"
+      : forecastDataset.sourceKind === "nowcast"
+        ? "CDIP nowcast loaded"
+        : forecastDataset.sourceKind === "hindcast"
+          ? "CDIP hindcast loaded"
+          : "Local fallback forecast";
   state.selectedForecast = forecastDataset;
+  state.selectedPierTransect = await loadPierTransect(transectLabel);
+  if (isSelectionRequestStale(selectionRequestId, transectLabel)) {
+    return;
+  }
   renderCharts(forecastDataset, tideSeries, windSeries);
   refreshComputedResults(sanitizeParams(readModelParamsFromInputs()));
   scheduleTopRowHeightCapture();
@@ -852,17 +1006,24 @@ function sanitizeParams(rawParams) {
 
 function getDefaultsForTransect(transectOrLabel) {
   const label = typeof transectOrLabel === "string" ? transectOrLabel : transectOrLabel?.label;
-  const demoDefaults = state.manifest.datasets[label]?.defaults;
+  const demoDefaults = state.manifest.datasets?.[label]?.defaults;
   const defaults = { ...(demoDefaults || state.genericDefaults) };
   const duneWidth = Number(defaults.duneWidth);
   const slopeEstimate = typeof transectOrLabel === "string"
     ? null
     : estimateAverageBeachSlopeFromTransect(transectOrLabel);
+  const knownProfile = getKnownTransectProfile(label);
   return {
     ...defaults,
     averageBeachSlope: slopeEstimate?.slope ?? defaults.averageBeachSlope,
     toeToCrestDistance: Number.isFinite(duneWidth) ? duneWidth / 2 : 15,
+    ...knownProfile,
   };
+}
+
+function getKnownTransectProfile(transectOrLabel) {
+  const label = typeof transectOrLabel === "string" ? transectOrLabel : transectOrLabel?.label;
+  return state.knownTransectProfiles.get(normalizeTransectLabel(label)) || null;
 }
 
 function estimateAverageBeachSlopeFromTransect(transect) {
@@ -894,6 +1055,13 @@ function estimateAverageBeachSlopeFromTransect(transect) {
 }
 
 function syncAverageBeachSlopeInputTitle(transect) {
+  const knownProfile = getKnownTransectProfile(transect);
+  if (Number.isFinite(knownProfile?.averageBeachSlope)) {
+    dom.averageBeachSlopeInput.title =
+      `Loaded from ${KNOWN_TRANSECTS_CSV_URL} for transect ${normalizeTransectLabel(transect?.label)}; edit if updated surveyed profile data are available.`;
+    return;
+  }
+
   const estimate = estimateAverageBeachSlopeFromTransect(transect);
   if (!estimate) {
     dom.averageBeachSlopeInput.title = "Average beach-face slope over the swash zone; edit if surveyed profile data are available.";
@@ -980,6 +1148,8 @@ function buildBeachProfile(params) {
 function renderProfileSvg({
   profile,
   overlays,
+  pierDeck = null,
+  waterLevel = 0,
   yMin,
   yMax,
   title,
@@ -1006,10 +1176,24 @@ function renderProfileSvg({
     y: profile.y.map((value) => convertElevationForDisplay(value)),
     xEnd: convertDistanceForDisplay(profile.xEnd),
   };
+  const shorelineProfileX = findProfileXAtElevation(profile, 0);
+  const pierDeckProfilePoints = (pierDeck?.points || [])
+    .map((point) => ({
+      x: shorelineProfileX - point.offshoreDistance,
+      y: point.elevation,
+    }))
+    .filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y));
+  const displayPierDeckPoints = pierDeckProfilePoints.map((point) => ({
+    x: convertDistanceForDisplay(point.x),
+    y: convertElevationForDisplay(point.y),
+  }));
   const displayYMin = convertElevationForDisplay(yMin);
   const displayYMax = convertElevationForDisplay(yMax);
+  const displayXMin = Math.min(0, ...displayPierDeckPoints.map((point) => point.x));
+  const displayXMax = Math.max(displayProfile.xEnd, ...displayPierDeckPoints.map((point) => point.x));
+  const displayXSpan = Math.max(displayXMax - displayXMin, 1);
 
-  const xScale = (value) => padding.left + (value / displayProfile.xEnd) * chartWidth;
+  const xScale = (value) => padding.left + ((value - displayXMin) / displayXSpan) * chartWidth;
   const yScale = (value) => padding.top + ((displayYMax - value) / (displayYMax - displayYMin)) * chartHeight;
   const gradientId = `water-gradient-${Math.random().toString(36).slice(2, 10)}`;
 
@@ -1018,19 +1202,24 @@ function renderProfileSvg({
     .join(" ");
   const filledBeachPath = `${beachPath} L ${xScale(displayProfile.x.at(-1)).toFixed(2)} ${yScale(displayYMin).toFixed(2)} L ${xScale(displayProfile.x[0]).toFixed(2)} ${yScale(displayYMin).toFixed(2)} Z`;
 
-  const xWaterEnd = convertDistanceForDisplay(clamp((0 - yMin) / (state.modelParams.averageBeachSlope || 0.05), 0, profile.xEnd));
-  const gridX = Array.from({ length: 5 }, (_, index) => (displayProfile.xEnd * index) / 4);
+  const waterEndProfileX = findProfileXAtElevation(profile, waterLevel);
+  const xWaterEnd = convertDistanceForDisplay(clamp(waterEndProfileX, 0, profile.xEnd));
+  const displayWaterLevel = convertElevationForDisplay(waterLevel);
+  const gridX = Array.from({ length: 5 }, (_, index) => displayXMin + (displayXSpan * index) / 4);
   const gridY = Array.from({ length: 6 }, (_, index) => displayYMin + ((displayYMax - displayYMin) * index) / 5);
 
   const overlayMarkup = overlays
     .map((overlay) => {
       const extent = computeOverlayExtent(profile, overlay.value, overlay.mode);
-      const displayStart = convertDistanceForDisplay(extent.start);
+      const displayStart = overlay.extendLeftToAxis ? displayXMin : convertDistanceForDisplay(extent.start);
       const displayEnd = convertDistanceForDisplay(extent.end);
       const displayValue = convertElevationForDisplay(overlay.value);
-      return `<line x1="${xScale(displayStart).toFixed(2)}" y1="${yScale(displayValue).toFixed(2)}" x2="${xScale(displayEnd).toFixed(2)}" y2="${yScale(displayValue).toFixed(2)}" stroke="${overlay.color}" stroke-width="4" ${overlay.dash ? `stroke-dasharray="${overlay.dash}"` : ""} />`;
+      return `<line x1="${xScale(displayStart).toFixed(2)}" y1="${yScale(displayValue).toFixed(2)}" x2="${xScale(displayEnd).toFixed(2)}" y2="${yScale(displayValue).toFixed(2)}" stroke="${overlay.color}" stroke-width="${overlay.strokeWidth || 4}" ${overlay.dash ? `stroke-dasharray="${overlay.dash}"` : ""} />`;
     })
     .join("");
+  const pierDeckMarkup = displayPierDeckPoints.length >= 2
+    ? `<polyline points="${displayPierDeckPoints.map((point) => `${xScale(point.x).toFixed(2)},${yScale(point.y).toFixed(2)}`).join(" ")}" fill="none" stroke="${COLORS.pierDeck}" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"><title>${escapeHtml(pierDeck.label)} pier deck</title></polyline>`
+    : "";
   const footerMarkup = footerLines
     .slice(0, 2)
     .map((line, index) => {
@@ -1039,7 +1228,12 @@ function renderProfileSvg({
       return `<text x="${x}" y="${height - 26}" fill="#60748a" font-size="11" font-weight="700" text-anchor="${anchor}">${escapeHtml(line)}</text>`;
     })
     .join("");
-  const legendItems = showLegend ? overlays.slice(0, 5) : [];
+  const legendItems = showLegend
+    ? [
+      ...overlays,
+      ...(pierDeckMarkup ? [{ label: "Pier Deck", color: COLORS.pierDeck, dash: "", strokeWidth: 5 }] : []),
+    ]
+    : [];
   const legendWidth = 176;
   const legendPadding = 12;
   const legendItemGap = 18;
@@ -1053,7 +1247,7 @@ function renderProfileSvg({
         ${legendItems.map((overlay, index) => {
           const y = legendPadding + 14 + index * legendItemGap;
           return `
-            <line x1="12" y1="${y - 4}" x2="42" y2="${y - 4}" stroke="${overlay.color}" stroke-width="3" ${overlay.dash ? `stroke-dasharray="${overlay.dash}"` : ""} />
+            <line x1="12" y1="${y - 4}" x2="42" y2="${y - 4}" stroke="${overlay.color}" stroke-width="${overlay.strokeWidth || 3}" ${overlay.dash ? `stroke-dasharray="${overlay.dash}"` : ""} />
             <text x="50" y="${y}" fill="#102338" font-size="11" font-weight="700">${escapeHtml(overlay.label)}</text>
           `;
         }).join("")}
@@ -1072,9 +1266,10 @@ function renderProfileSvg({
       <rect x="0" y="0" width="${width}" height="${height}" fill="transparent" />
       ${gridX.map((value) => `<line x1="${xScale(value)}" y1="${padding.top}" x2="${xScale(value)}" y2="${padding.top + chartHeight}" stroke="rgba(17,49,76,0.08)" stroke-width="1" />`).join("")}
       ${gridY.map((value) => `<line x1="${padding.left}" y1="${yScale(value)}" x2="${padding.left + chartWidth}" y2="${yScale(value)}" stroke="rgba(17,49,76,0.08)" stroke-width="1" />`).join("")}
-      <rect x="${xScale(0)}" y="${yScale(convertElevationForDisplay(0))}" width="${Math.max(xScale(xWaterEnd) - xScale(0), 0)}" height="${Math.max(yScale(displayYMin) - yScale(convertElevationForDisplay(0)), 0)}" fill="url(#${gradientId})" />
+      <rect x="${xScale(displayXMin)}" y="${yScale(displayWaterLevel)}" width="${Math.max(xScale(xWaterEnd) - xScale(displayXMin), 0)}" height="${Math.max(yScale(displayYMin) - yScale(displayWaterLevel), 0)}" fill="${COLORS.water}" opacity="0.82" />
       <path d="${filledBeachPath}" fill="${COLORS.sand}" opacity="0.95" />
       <path d="${beachPath}" fill="none" stroke="${COLORS.sandEdge}" stroke-width="3" />
+      ${pierDeckMarkup}
       ${overlayMarkup}
       ${legendMarkup}
       ${hasTitle ? `<text x="${padding.left}" y="16" fill="#102338" font-size="16" font-weight="800">${escapeHtml(title)}</text>` : ""}
@@ -1111,14 +1306,53 @@ function computeOverlayExtent(profile, elevation, mode = "runup") {
   };
 }
 
+function findProfileXAtElevation(profile, elevation) {
+  if (!profile?.x?.length || !profile?.y?.length) {
+    return 0;
+  }
+  const finiteElevations = profile.y.filter(Number.isFinite);
+  if (!finiteElevations.length) {
+    return profile.x[0] || 0;
+  }
+  if (elevation <= Math.min(...finiteElevations)) {
+    return profile.x[0] || 0;
+  }
+
+  for (let index = 1; index < profile.x.length; index += 1) {
+    const previousY = profile.y[index - 1];
+    const currentY = profile.y[index];
+    const crossesElevation =
+      (previousY <= elevation && currentY >= elevation) ||
+      (previousY >= elevation && currentY <= elevation);
+    if (crossesElevation) {
+      const yDelta = currentY - previousY;
+      if (Math.abs(yDelta) < 1e-9) {
+        return profile.x[index];
+      }
+      const fraction = (elevation - previousY) / yDelta;
+      return profile.x[index - 1] + fraction * (profile.x[index] - profile.x[index - 1]);
+    }
+  }
+  return profile.x.at(-1) || 0;
+}
+
 async function loadForecastDataset(label) {
-  if (state.datasetCache.has(label)) {
-    return state.datasetCache.get(label);
+  const cacheKey = state.hindcastWindow
+    ? `${label}:hindcast:${state.hindcastWindow.startMs}:${state.hindcastWindow.endMs}`
+    : `${label}:forecast`;
+  if (state.datasetCache.has(cacheKey)) {
+    return state.datasetCache.get(cacheKey);
+  }
+
+  if (state.hindcastWindow) {
+    const historicalDataset = await fetchHistoricalMopDataset(label, state.hindcastWindow);
+    state.datasetCache.set(cacheKey, historicalDataset);
+    return historicalDataset;
   }
 
   try {
     const liveDataset = await fetchLiveForecastDataset(label);
-    state.datasetCache.set(label, liveDataset);
+    state.datasetCache.set(cacheKey, liveDataset);
     return liveDataset;
   } catch (error) {
     console.warn("[FASTER MOP] Live forecast fetch failed.", {
@@ -1141,8 +1375,101 @@ async function loadForecastDataset(label) {
     transect: label,
     forecastFile: datasetMeta.forecastFile,
   });
-  state.datasetCache.set(label, forecastDataset);
+  state.datasetCache.set(cacheKey, forecastDataset);
   return forecastDataset;
+}
+
+async function fetchHistoricalMopDataset(label, hindcastWindow) {
+  const source = selectHistoricalMopSource(hindcastWindow);
+  const startIndex = Math.round((hindcastWindow.startMs - source.startMs) / MS_PER_HOUR);
+  const endIndex = Math.round((hindcastWindow.endMs - source.startMs) / MS_PER_HOUR);
+  const requestUrl = buildThreddsAsciiMopWindowUrl(label, source.fileSuffix, startIndex, endIndex);
+
+  console.info("[FASTER MOP] Requesting CDIP historical MOP window.", {
+    transect: label,
+    sourceKind: source.sourceKind,
+    start: new Date(hindcastWindow.startMs).toISOString(),
+    end: new Date(hindcastWindow.endMs).toISOString(),
+    startIndex,
+    endIndex,
+    requestUrl,
+  });
+
+  const response = await fetch(requestUrl);
+  const bodyText = await response.text();
+  if (!response.ok) {
+    const detail = extractThreddsErrorDetail(bodyText);
+    throw new Error(`CDIP ${source.sourceKind} request failed with ${response.status}${detail ? `: ${detail}` : ""}`);
+  }
+
+  const forecastDataset = parseDap2AsciiForecast(bodyText, {
+    label,
+    requestUrl,
+    sourceKind: source.sourceKind,
+    sourceLabel: `${label} ${source.sourceKind}`,
+  });
+  console.info("[FASTER MOP] CDIP historical MOP window loaded.", {
+    transect: label,
+    sourceKind: source.sourceKind,
+    points: forecastDataset.waveTimeMs.length,
+    first: forecastDataset.waveTime[0],
+    last: forecastDataset.waveTime.at(-1),
+  });
+  return forecastDataset;
+}
+
+function selectHistoricalMopSource(hindcastWindow) {
+  if (hindcastWindow.startMs >= CDIP_NOWCAST_START_MS) {
+    return {
+      sourceKind: "nowcast",
+      fileSuffix: "nowcast",
+      startMs: CDIP_NOWCAST_START_MS,
+    };
+  }
+
+  if (hindcastWindow.startMs < CDIP_HINDCAST_START_MS || hindcastWindow.endMs > CDIP_HINDCAST_END_MS) {
+    throw new Error(
+      `Requested start_date ${hindcastWindow.rawStartDate} is outside the supported CDIP hindcast/nowcast range. ` +
+      `Use dates from ${formatIsoDate(CDIP_HINDCAST_START_MS)} through the current CDIP nowcast period.`
+    );
+  }
+
+  return {
+    sourceKind: "hindcast",
+    fileSuffix: "hindcast",
+    startMs: CDIP_HINDCAST_START_MS,
+  };
+}
+
+async function loadPierTransect(label) {
+  const normalizedLabel = normalizeTransectLabel(label);
+  if (!normalizedLabel) {
+    return null;
+  }
+  if (state.pierTransectCache.has(normalizedLabel)) {
+    return state.pierTransectCache.get(normalizedLabel);
+  }
+
+  const url = `${PIER_TRANSECTS_BASE_URL}/${normalizedLabel.toLowerCase()}.csv`;
+  const csvText = await fetchOptionalText(url, { suppressMissingWarning: true });
+  const points = parsePierTransectPoints(csvText);
+  const pierTransect = points.length >= 2
+    ? {
+      label: normalizedLabel,
+      sourceUrl: url,
+      points,
+    }
+    : null;
+
+  state.pierTransectCache.set(normalizedLabel, pierTransect);
+  if (pierTransect) {
+    console.info("[FASTER Explorer] Loaded pier transect overlay.", {
+      transect: normalizedLabel,
+      points: points.length,
+      source: url,
+    });
+  }
+  return pierTransect;
 }
 
 async function fetchLiveForecastDataset(label) {
@@ -1237,6 +1564,20 @@ function buildThreddsAsciiForecastUrl(label) {
   return `${CDIP_DAP2_ASCII_BASE_URL}/${encodeURIComponent(label)}_forecast.nc.ascii?${CDIP_DAP2_ASCII_QUERY}`;
 }
 
+function buildThreddsAsciiMopWindowUrl(label, fileSuffix, startIndex, endIndex) {
+  const encodedLabel = encodeURIComponent(label);
+  const encodedSuffix = encodeURIComponent(fileSuffix);
+  const query = [
+    `waveTime[${startIndex}:1:${endIndex}]`,
+    `waveHs[${startIndex}:1:${endIndex}]`,
+    `waveTp[${startIndex}:1:${endIndex}]`,
+    `waveDp[${startIndex}:1:${endIndex}]`,
+    "metaWaterDepth",
+    "metaShoreNormal",
+  ].join(",");
+  return `${CDIP_DAP2_ASCII_BASE_URL}/${encodedLabel}_${encodedSuffix}.nc.ascii?${query}`;
+}
+
 function extractThreddsErrorDetail(bodyText) {
   if (!bodyText) {
     return "";
@@ -1286,8 +1627,8 @@ function parseDap2AsciiForecast(bodyText, metadata) {
       metaShoreNormal,
     },
     {
-      sourceKind: "live",
-      sourceLabel: metadata.label,
+      sourceKind: metadata.sourceKind || "live",
+      sourceLabel: metadata.sourceLabel || metadata.label,
     }
   );
 }
@@ -1343,7 +1684,7 @@ function normalizeForecastDataset(raw, metadata = {}) {
 }
 
 async function loadTideSeries(stationId, startMs, endMs) {
-  const cacheKey = `${stationId}:${startMs}:${endMs}`;
+  const cacheKey = `${stationId}:${NOAA_VERTICAL_DATUM}:${startMs}:${endMs}`;
   if (state.tideCache.has(cacheKey)) {
     console.info("[FASTER NOAA] Using cached hourly tide predictions.", {
       stationId,
@@ -1358,7 +1699,7 @@ async function loadTideSeries(stationId, startMs, endMs) {
     end_date: formatNoaaDate(endMs),
     station: stationId,
     product: "predictions",
-    datum: "MLLW",
+    datum: NOAA_VERTICAL_DATUM,
     interval: "h",
     units: "metric",
     time_zone: "gmt",
@@ -1369,6 +1710,7 @@ async function loadTideSeries(stationId, startMs, endMs) {
   const requestUrl = `${NOAA_PREDICTIONS_URL}?${params.toString()}`;
   console.info("[FASTER NOAA] Requesting hourly tide predictions.", {
     stationId,
+    datum: NOAA_VERTICAL_DATUM,
     start: formatNoaaDate(startMs),
     end: formatNoaaDate(endMs),
     requestUrl,
@@ -1391,6 +1733,7 @@ async function loadTideSeries(stationId, startMs, endMs) {
   };
   console.info("[FASTER NOAA] Loaded hourly tide predictions.", {
     stationId,
+    datum: NOAA_VERTICAL_DATUM,
     points: tideSeries.timeMs.length,
     first: payload.predictions[0]?.t || null,
     last: payload.predictions.at(-1)?.t || null,
@@ -1466,6 +1809,133 @@ async function loadWindForecastSeries(transect, startMs, endMs) {
     expiresAtMs: nowMs + NWS_WIND_CACHE_TTL_MS,
   });
   return series;
+}
+
+async function loadHistoricalWindSeries(transect, startMs, endMs) {
+  const lat = Number(transect?.predictionLat);
+  const lon = Number(transect?.predictionLon);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+    throw new Error("Selected transect does not include a valid historical wind point.");
+  }
+
+  const cacheKey = `historical:${lat.toFixed(4)},${lon.toFixed(4)}:${startMs}:${endMs}`;
+  const cached = state.windCache.get(cacheKey);
+  const nowMs = Date.now();
+  if (cached && cached.expiresAtMs > nowMs) {
+    return cached.series;
+  }
+
+  const requestUrl = buildOpenMeteoHistoricalWindUrl(lat, lon, startMs, endMs);
+  const payload = await fetchOpenMeteoJson(requestUrl);
+  const hourly = payload.hourly || {};
+  const speedIntervals = parseOpenMeteoHourlyWindIntervals(hourly, startMs, endMs);
+  if (!speedIntervals.length) {
+    throw new Error("Open-Meteo historical wind response did not include any usable hourly wind speeds.");
+  }
+
+  const chopIntervals = speedIntervals.map((point) => ({
+    ...point,
+    value: estimateChopHeightMeters(point.value),
+  }));
+
+  const series = {
+    sourceKind: "historical-open-meteo",
+    sourceLabel: "Open-Meteo historical reanalysis",
+    requestUrl,
+    latitude: payload.latitude ?? lat,
+    longitude: payload.longitude ?? lon,
+    elevation: payload.elevation ?? null,
+    generationTimeMs: payload.generationtime_ms ?? null,
+    timezone: payload.timezone || "GMT",
+    startMs,
+    endMs,
+    chopIntervals,
+    speedPoints: buildIntervalStepPoints(speedIntervals),
+    chopPoints: buildIntervalStepPoints(chopIntervals),
+    speedIntervalCount: speedIntervals.length,
+    chopIntervalCount: chopIntervals.length,
+  };
+
+  console.info("[FASTER Open-Meteo] Loaded historical wind data.", {
+    transect: transect.label,
+    latitude: series.latitude,
+    longitude: series.longitude,
+    speedIntervals: series.speedIntervalCount,
+    chopIntervals: series.chopIntervalCount,
+  });
+
+  state.windCache.set(cacheKey, {
+    series,
+    expiresAtMs: nowMs + NWS_WIND_CACHE_TTL_MS,
+  });
+  return series;
+}
+
+function buildOpenMeteoHistoricalWindUrl(lat, lon, startMs, endMs) {
+  const endDateMs = Math.max(startMs, endMs - 1);
+  const params = new URLSearchParams({
+    latitude: lat.toFixed(5),
+    longitude: lon.toFixed(5),
+    start_date: formatIsoDate(startMs),
+    end_date: formatIsoDate(endDateMs),
+    hourly: "wind_speed_10m,wind_direction_10m",
+    wind_speed_unit: "kmh",
+    timezone: "GMT",
+    cell_selection: "sea",
+  });
+  return `${OPEN_METEO_HISTORICAL_URL}?${params.toString()}`;
+}
+
+async function fetchOpenMeteoJson(url) {
+  const response = await fetch(url, {
+    headers: {
+      Accept: "application/json",
+    },
+  });
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) {
+    const reason = payload?.reason || payload?.error || `status ${response.status}`;
+    throw new Error(`Open-Meteo historical wind request failed: ${reason}`);
+  }
+  return payload;
+}
+
+function parseOpenMeteoHourlyWindIntervals(hourly, windowStartMs, windowEndMs) {
+  const times = hourly?.time || [];
+  const speeds = hourly?.wind_speed_10m || [];
+  return times
+    .map((timeText, index) => {
+      const startMs = Date.parse(`${timeText}Z`);
+      const value = Number(speeds[index]);
+      if (!Number.isFinite(startMs) || !Number.isFinite(value)) {
+        return null;
+      }
+      const endMs = startMs + MS_PER_HOUR;
+      if (endMs <= windowStartMs || startMs >= windowEndMs) {
+        return null;
+      }
+      return {
+        startMs: Math.max(startMs, windowStartMs),
+        endMs: Math.min(endMs, windowEndMs),
+        value,
+      };
+    })
+    .filter(Boolean)
+    .filter((interval) => interval.endMs > interval.startMs);
+}
+
+function createHistoricalWindUnavailableSeries(tideWindow, message = "Historical wind data are unavailable; hindcast chop is set to 0.") {
+  return {
+    historicalUnavailable: true,
+    emptyMessage: message,
+    startMs: tideWindow.startMs,
+    endMs: tideWindow.endMs,
+    chopIntervals: [],
+    speedPoints: [],
+    chopPoints: [],
+    speedIntervalCount: 0,
+    chopIntervalCount: 0,
+  };
 }
 
 async function fetchNwsJson(url) {
@@ -1587,18 +2057,25 @@ function findIntervalValueAtTime(intervals, targetMs, fallbackValue = null) {
   return containingInterval ? containingInterval.value : fallbackValue;
 }
 
-async function loadSeaLevelAnomalyEstimate(stationId) {
-  const cached = state.seaLevelAnomalyCache.get(stationId);
+async function loadSeaLevelAnomalyEstimate(stationId, window = null) {
+  const cacheKey = window
+    ? `${stationId}:${NOAA_VERTICAL_DATUM}:${window.startMs}:${window.endMs}`
+    : `${stationId}:${NOAA_VERTICAL_DATUM}`;
+  const cached = state.seaLevelAnomalyCache.get(cacheKey);
   const nowMs = Date.now();
   if (cached && cached.expiresAtMs > nowMs) {
     return cached.estimate;
   }
 
-  const endMs = floorUtcTimeToMinuteInterval(
-    nowMs - SEA_LEVEL_ANOMALY_END_LAG_MINUTES * MS_PER_MINUTE,
-    SEA_LEVEL_ANOMALY_INTERVAL_MINUTES
-  );
-  const startMs = endMs - SEA_LEVEL_ANOMALY_LOOKBACK_DAYS * MS_PER_DAY;
+  const endMs = window
+    ? floorUtcTimeToMinuteInterval(window.endMs, SEA_LEVEL_ANOMALY_INTERVAL_MINUTES)
+    : floorUtcTimeToMinuteInterval(
+      nowMs - SEA_LEVEL_ANOMALY_END_LAG_MINUTES * MS_PER_MINUTE,
+      SEA_LEVEL_ANOMALY_INTERVAL_MINUTES
+    );
+  const startMs = window
+    ? floorUtcTimeToMinuteInterval(window.startMs, SEA_LEVEL_ANOMALY_INTERVAL_MINUTES)
+    : endMs - SEA_LEVEL_ANOMALY_LOOKBACK_DAYS * MS_PER_DAY;
 
   const [observedSeries, predictedSeries] = await Promise.all([
     loadNoaaWaterLevelSeries({
@@ -1629,8 +2106,9 @@ async function loadSeaLevelAnomalyEstimate(stationId) {
     pairCount: residuals.length,
     observedCount: observedSeries.length,
     predictedCount: predictedSeries.length,
+    isHistoricalWindow: Boolean(window),
   };
-  state.seaLevelAnomalyCache.set(stationId, {
+  state.seaLevelAnomalyCache.set(cacheKey, {
     estimate,
     expiresAtMs: nowMs + SEA_LEVEL_ANOMALY_CACHE_TTL_MS,
   });
@@ -1643,7 +2121,7 @@ async function loadNoaaWaterLevelSeries({ stationId, product, interval, startMs,
     end_date: formatNoaaDate(endMs),
     station: stationId,
     product,
-    datum: "MLLW",
+    datum: NOAA_VERTICAL_DATUM,
     units: "metric",
     time_zone: "gmt",
     format: "json",
@@ -1760,7 +2238,9 @@ function computeRunupAtTime(input) {
     bCoefficient,
   });
 
-  const maxCrest = input.tideLevel + breakingSummary.breakingWaveHeight * 1.3 * 0.55;
+  const maxCrest = input.tideLevel + breakingSummary.breakingWaveHeight * MAX_WAVE_RATIO * CREST_RATIO;
+  const maxWaveSplashUp =
+    input.tideLevel + 2.0 * breakingSummary.breakingWaveHeight * MAX_WAVE_RATIO * CREST_RATIO;
 
   const setupStockdon = 1.1 * 0.35 * slope * Math.sqrt(Lo * Ho);
   const waveRunupStockdon = 1.1 * 0.5 * Math.sqrt(Ho * Lo * (0.563 * slope ** 2 + 0.0004));
@@ -1791,9 +2271,10 @@ function computeRunupAtTime(input) {
   const runupPredictions = [stockdonTotal, parkTotalMean, parkTotalSigma, modifiedTotal, modifiedTotalSigma];
   const stdDevRunup = sampleStandardDeviation(runupPredictions);
   const waveHeightVariability = Math.max((input.waveHeightTotal - input.waveHeightSwell) / 2, 0);
+  const longPeriodSwellUncertaintyFactor = getLongPeriodSwellUncertaintyFactor(peakPeriod);
   const expectedRunup = meanRunup;
-  const conservativeRunup = meanRunup + stdDevRunup;
-  const upperBoundRunup = meanRunup + stdDevRunup + waveHeightVariability;
+  const conservativeRunup = meanRunup + longPeriodSwellUncertaintyFactor * stdDevRunup;
+  const upperBoundRunup = conservativeRunup + waveHeightVariability;
   const category = classifyOvertopping({
     expectedRunup,
     conservativeRunup,
@@ -1812,15 +2293,25 @@ function computeRunupAtTime(input) {
     relativeAngleDeg: shallowRelativeAngleDeg,
     deepWaterWaveHeight: Ho,
     maxCrest,
+    maxWaveSplashUp,
     breakingDepth: breakingSummary.breakingDepth,
     breakingWaveHeight: breakingSummary.breakingWaveHeight,
     expectedRunup,
     conservativeRunup,
     upperBoundRunup,
     stdDevRunup,
+    longPeriodSwellUncertaintyFactor,
     waveHeightVariability,
     category,
   };
+}
+
+function getLongPeriodSwellUncertaintyFactor(peakPeriodSeconds) {
+  const period = Number(peakPeriodSeconds);
+  if (!Number.isFinite(period)) {
+    return 1;
+  }
+  return (Math.max(period, 0) / 18) ** 4;
 }
 
 function solveBreakingDepth({ Ho, Lo, peakPeriod, waveHeightSwell, angDRad, aCoefficient, bCoefficient }) {
@@ -1988,7 +2479,7 @@ function renderTideOnlyPreview(tideSeries, tideWindow) {
         y: {
           title: {
             display: true,
-            text: ["Tide Level", state.displayUnits === "english" ? "(ft, MLLW)" : "(m, MLLW)"],
+            text: ["Tide Level", getVerticalDatumUnitLabel()],
             color: COLORS.green,
           },
           ticks: { color: COLORS.green },
@@ -2185,7 +2676,7 @@ function renderCharts(forecastDataset, tideSeries, windSeries = null) {
         y: {
           title: {
             display: true,
-            text: ["Tide Level", state.displayUnits === "english" ? "(ft, MLLW)" : "(m, MLLW)"],
+            text: ["Tide Level", getVerticalDatumUnitLabel()],
             color: COLORS.green,
           },
           ticks: { color: COLORS.green },
@@ -2252,7 +2743,7 @@ function renderCharts(forecastDataset, tideSeries, windSeries = null) {
         tooltip: { callbacks: { title: tooltipTimeTitle } },
         currentTimeLine: { value: state.results?.[state.currentIndex]?.timeMs, color: COLORS.aqua },
         emptyStateMessage: {
-          message: "NWS wind forecast was unavailable for this forecast window.",
+          message: windSeries?.emptyMessage || "Wind data were unavailable for this playback window.",
         },
       },
       scales: {
@@ -2334,17 +2825,39 @@ function updatePlaybackUI() {
 
   const profile = buildBeachProfile(state.modelParams);
   const figureAspectRatio = getContainerAspectRatio(dom.runupProfile, DEFAULT_FIGURE_RATIO);
+  const pierDeckMaxElevation = getPierDeckMaxElevation(state.selectedPierTransect);
+  const hasPierDeck = Boolean(state.selectedPierTransect);
+  const runupOverlays = [
+    { label: "Still Water", value: current.tideLevel, color: COLORS.waterEdge, dash: "", mode: "water", extendLeftToAxis: true },
+    { label: "Max Crest", value: current.maxCrest, color: COLORS.black, dash: "10 6", mode: "crest", extendLeftToAxis: true },
+    ...(hasPierDeck
+      ? [{
+        label: "Max Wave Splash-up",
+        value: current.maxWaveSplashUp,
+        color: "#8a8f98",
+        dash: "6 7",
+        mode: "crest",
+        strokeWidth: 2,
+        extendLeftToAxis: true,
+      }]
+      : []),
+    { label: "Expected Runup", value: current.expectedRunup, color: COLORS.green, dash: "12 8", mode: "runup" },
+    { label: "Conservative Runup", value: current.conservativeRunup, color: COLORS.yellow, dash: "12 8", mode: "runup" },
+    { label: "Upper Bound Runup", value: current.upperBoundRunup, color: COLORS.coral, dash: "12 8", mode: "runup" },
+  ];
   dom.runupProfile.innerHTML = renderProfileSvg({
     profile,
-    overlays: [
-      { label: "Still Water", value: current.tideLevel, color: COLORS.waterEdge, dash: "", mode: "water" },
-      { label: "Max Crest", value: current.maxCrest, color: COLORS.black, dash: "10 6", mode: "crest" },
-      { label: "Expected Runup", value: current.expectedRunup, color: COLORS.green, dash: "12 8", mode: "runup" },
-      { label: "Conservative Runup", value: current.conservativeRunup, color: COLORS.yellow, dash: "12 8", mode: "runup" },
-      { label: "Upper Bound Runup", value: current.upperBoundRunup, color: COLORS.coral, dash: "12 8", mode: "runup" },
-    ],
+    overlays: runupOverlays,
+    pierDeck: state.selectedPierTransect,
+    waterLevel: current.tideLevel,
     yMin: -5,
-    yMax: Math.max(state.modelParams.duneCrestElevation + 1.2, current.upperBoundRunup + 1.2, current.maxCrest + 1.2),
+    yMax: Math.max(
+      state.modelParams.duneCrestElevation + 1.2,
+      current.upperBoundRunup + 1.2,
+      current.maxCrest + 1.2,
+      (hasPierDeck ? current.maxWaveSplashUp + 0.8 : Number.NEGATIVE_INFINITY),
+      pierDeckMaxElevation + 0.8
+    ),
     title: `Runup profile at ${formatShortDateTime(current.timeMs)} ${getTimeModeLabel()} - ${current.category.figureLabel}`,
     figureAspectRatio,
     footerLines: [],
@@ -2636,6 +3149,59 @@ function parseCaliforniaTideStations(csvText) {
     .filter(Boolean);
 }
 
+function parseKnownTransectProfiles(csvText) {
+  const profiles = new Map();
+  parseCsv(csvText || "").forEach((row) => {
+    const label = normalizeTransectLabel(row.Transect || row.transect || row.Label || row.label);
+    if (!label) {
+      return;
+    }
+
+    const profile = removeUndefinedValues({
+      averageBeachSlope: parseFiniteCsvNumber(row["Face Slope"]),
+      beachElevationBase: parseFiniteCsvNumber(row["Toe Elevation"]),
+      bermWidth: parseFiniteCsvNumber(row["Toe Distance"]),
+      duneCrestElevation: parseFiniteCsvNumber(row["Crest Elevation"]),
+      toeToCrestDistance: parseFiniteCsvNumber(row["Crest Distance"]),
+    });
+    if (Object.keys(profile).length) {
+      profiles.set(label, profile);
+    }
+  });
+
+  console.info("[FASTER Explorer] Loaded known transect beach profiles.", {
+    count: profiles.size,
+    source: KNOWN_TRANSECTS_CSV_URL,
+  });
+  return profiles;
+}
+
+function parsePierTransectPoints(csvText) {
+  return parseCsv(csvText || "")
+    .map((row) => ({
+      offshoreDistance: parseFiniteCsvNumber(row.x ?? row.X),
+      elevation: parseFiniteCsvNumber(row.z ?? row.Z),
+    }))
+    .filter((point) => Number.isFinite(point.offshoreDistance) && Number.isFinite(point.elevation));
+}
+
+function parseFiniteCsvNumber(value) {
+  if (value === null || value === undefined || String(value).trim() === "") {
+    return undefined;
+  }
+  const number = Number(value);
+  return Number.isFinite(number) ? number : undefined;
+}
+
+function removeUndefinedValues(rawObject) {
+  return Object.entries(rawObject).reduce((cleanObject, [key, value]) => {
+    if (value !== undefined) {
+      cleanObject[key] = value;
+    }
+    return cleanObject;
+  }, {});
+}
+
 function normalizeTideStation(rawStation) {
   const id = String(rawStation.id ?? "").trim();
   const name = String(rawStation.name ?? "").trim();
@@ -2715,6 +3281,9 @@ function getPlaybackStartIndex(results) {
   if (!results?.length) {
     return 0;
   }
+  if (state.hindcastWindow) {
+    return 0;
+  }
 
   const nowMs = Date.now();
   for (let index = results.length - 1; index >= 0; index -= 1) {
@@ -2728,6 +3297,9 @@ function getPlaybackStartIndex(results) {
 function getPlaybackStartTime(timeValues, fallbackTime) {
   if (!timeValues?.length) {
     return fallbackTime;
+  }
+  if (state.hindcastWindow) {
+    return timeValues[0] ?? fallbackTime;
   }
 
   const nowMs = Date.now();
@@ -2751,6 +3323,9 @@ function formatForecastOvertoppingLabel(category, results) {
   }
 
   const dayCount = Math.max(1, Math.ceil((endMs - startMs) / MS_PER_DAY));
+  if (state.hindcastWindow) {
+    return `${category.forecastLabel} over selected ${dayCount} day${dayCount === 1 ? "" : "s"}`;
+  }
   return `${category.forecastLabel} over next ${dayCount} day${dayCount === 1 ? "" : "s"}`;
 }
 
@@ -2809,6 +3384,12 @@ function floorUtcTimeToMinuteInterval(timeMs, intervalMinutes) {
   return date.getTime();
 }
 
+function floorUtcTimeToHour(timeMs) {
+  const date = new Date(timeMs);
+  date.setUTCMinutes(0, 0, 0);
+  return date.getTime();
+}
+
 function convertLengthForDisplay(valueMeters) {
   return state.displayUnits === "english" ? valueMeters * FEET_PER_METER : valueMeters;
 }
@@ -2846,7 +3427,20 @@ function formatDisplayLength(valueMeters, digits = 2) {
   return `${convertLengthForDisplay(valueMeters).toFixed(digits)} ${state.displayUnits === "english" ? "ft" : "m"}`;
 }
 
+function getPierDeckMaxElevation(pierDeck) {
+  if (!pierDeck?.points?.length) {
+    return Number.NEGATIVE_INFINITY;
+  }
+  return Math.max(...pierDeck.points.map((point) => point.elevation).filter(Number.isFinite));
+}
+
 function formatWindChartTitle(windSeries) {
+  if (windSeries?.historicalUnavailable) {
+    return "Historical Wind/Chop Unavailable";
+  }
+  if (windSeries?.sourceKind === "historical-open-meteo") {
+    return "Open-Meteo Historical Wind - Reanalysis";
+  }
   if (windSeries?.gridId && windSeries.gridX !== null && windSeries.gridY !== null) {
     return `NWS Wind Forecast - ${windSeries.gridId}/${windSeries.gridX},${windSeries.gridY}`;
   }
@@ -2858,7 +3452,13 @@ function getDistanceAxisLabel() {
 }
 
 function getElevationAxisLabel() {
-  return state.displayUnits === "english" ? "Elevation (ft, MLLW)" : "Elevation (m, MLLW)";
+  return `Elevation ${getVerticalDatumUnitLabel()}`;
+}
+
+function getVerticalDatumUnitLabel() {
+  return state.displayUnits === "english"
+    ? `(ft, ${DISPLAY_VERTICAL_DATUM})`
+    : `(m, ${DISPLAY_VERTICAL_DATUM})`;
 }
 
 function getTimeModeLabel() {
@@ -2880,12 +3480,33 @@ function formatAxisDate(timeMs) {
   });
 }
 
+function formatIsoDate(timeMs) {
+  if (!Number.isFinite(timeMs)) {
+    return "";
+  }
+  return new Date(timeMs).toISOString().slice(0, 10);
+}
+
 function formatShortDateTime(timeMs) {
   if (!Number.isFinite(timeMs)) {
     return "";
   }
   return new Date(timeMs).toLocaleString("en-US", {
     timeZone: getDisplayTimeZone(),
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: false,
+  });
+}
+
+function formatShortUtcDateTime(timeMs) {
+  if (!Number.isFinite(timeMs)) {
+    return "";
+  }
+  return new Date(timeMs).toLocaleString("en-US", {
+    timeZone: "UTC",
     month: "short",
     day: "numeric",
     hour: "numeric",
@@ -2910,6 +3531,25 @@ function fetchText(url) {
     }
     return response.text();
   });
+}
+
+function fetchOptionalText(url, options = {}) {
+  return fetch(url)
+    .then((response) => {
+      if (response.status === 404) {
+        return "";
+      }
+      if (!response.ok) {
+        throw new Error(`Request failed for ${url} with status ${response.status}`);
+      }
+      return response.text();
+    })
+    .catch((error) => {
+      if (!options.suppressMissingWarning) {
+        console.warn(`[FASTER Explorer] Optional file unavailable: ${url}`, error);
+      }
+      return "";
+    });
 }
 
 function parseCsv(text) {

@@ -38,7 +38,7 @@
           </article>
           <article class="manual-summary-card">
             <strong>Hydrodynamic inputs</strong>
-            <span>CDIP MOP wave height, peak period, prediction depth, nearest NOAA tide predictions and recent observed water levels in MLLW, and NWS wind-speed forecasts for local chop.</span>
+            <span>CDIP MOP wave height, peak period, prediction depth, nearest NOAA tide predictions and recent observed water levels in NAVD88, plus wind-speed data for local chop.</span>
           </article>
           <article class="manual-summary-card">
             <strong>Geometry inputs</strong>
@@ -63,7 +63,7 @@
           <p>
             The operational concept is to start with wave conditions already predicted by the MOP system near the
             10 m depth contour, combine those conditions with NOAA tide predictions, a recent observed-minus-predicted
-            sea-level anomaly, an NWS wind-derived local chop proxy, and a user-defined shoreline geometry, then evaluate
+            sea-level anomaly, a wind-derived local chop proxy, and a user-defined shoreline geometry, then evaluate
             several empirical runup formulations to produce decision-ready water-level estimates.
           </p>
         </div>
@@ -73,9 +73,9 @@
         <h2>Operational Data Flow</h2>
         <ol class="manual-steps">
           <li>The Explorer loads statewide MOP transects from the compact <code>data/transects.json</code> web export.</li>
-          <li>When a transect is selected, the app requests the corresponding CDIP MOP forecast directly from the THREDDS DAP2 ASCII endpoint.</li>
-          <li>The app resolves the nearest NOAA tide station from the California station list, downloads hourly tide predictions in MLLW, and estimates a recent sea-level anomaly from observed minus predicted water levels.</li>
-          <li>The app requests NWS gridpoint wind-speed forecasts at the transect prediction point and converts those speeds into a local chop-height time series.</li>
+          <li>When a transect is selected, the app requests the corresponding CDIP MOP forecast directly from the THREDDS DAP2 ASCII endpoint. If the URL includes <code>start_date=MMDDYYYY</code>, the app instead requests an up-to-five-day CDIP MOP historical window from the matching <code>nowcast</code> or <code>hindcast</code> file. This URL mode is hindcast-only; if the requested five-day window would extend into the present, the end time is clipped to a safe historical hour before now so upstream nowcast files have time to land.</li>
+          <li>The app resolves the nearest NOAA tide station from the California station list, downloads hourly tide predictions in NAVD88, and estimates observed-minus-predicted sea-level anomaly from NOAA water levels. Forecast mode uses the recent residual window; hindcast mode uses the selected historical window.</li>
+          <li>In forecast mode, the app requests NWS gridpoint wind-speed forecasts at the transect prediction point and converts those speeds into a local chop-height time series. In hindcast mode, the app requests hourly 10 m historical/reanalysis wind speed from Open-Meteo at the transect prediction point and runs the same chop calculation.</li>
           <li>The Geometry Editor defines a stylized profile using the user inputs. Dune mode returns landward to the toe elevation; structure mode remains elevated landward of crest.</li>
           <li>For each forecast time, the app computes equivalent deep-water wave properties, breaker conditions, runup estimates, and summary water levels.</li>
           <li>The Explorer displays the wave, tide, wind, and chop time series, allows playback through forecast time, and plots the selected-time water levels across the edited profile.</li>
@@ -87,7 +87,7 @@
         <div class="manual-note">
           <h3>Units and datums</h3>
           <p>
-            The browser model computes internally in metric units. Elevations and water levels are meters relative to MLLW unless noted otherwise, distances are meters, wave periods are seconds, wind speed is converted to meters per second for the chop calculation, and angles are radians inside the equations unless a degree-valued source field is explicitly noted.
+            The browser model computes internally in metric units. Elevations and water levels are meters relative to NAVD88 unless noted otherwise, distances are meters, wave periods are seconds, wind speed is converted to meters per second for the chop calculation, and angles are radians inside the equations unless a degree-valued source field is explicitly noted.
           </p>
         </div>
         <div class="manual-sources variable-source-grid">
@@ -106,29 +106,31 @@
               <dt>&theta;<sub>shore-normal</sub></dt>
               <dd>Transect shore-normal direction in degrees, from CDIP MOP <code>metaShoreNormal</code> when present, otherwise <code>shoreNormal</code> in <code>data/transects.json</code>. It is not active in the current non-directional runup baseline.</dd>
               <dt>&eta;<sub>NOAA,pred</sub>, &eta;<sub>pred</sub></dt>
-              <dd>NOAA CO-OPS tide prediction in MLLW at the nearest tide station. Hourly predictions are used for forecast playback; six-minute predictions are used for the recent sea-level anomaly residual calculation.</dd>
+              <dd>NOAA CO-OPS tide prediction in NAVD88 at the nearest tide station, requested from the CO-OPS API with <code>datum=NAVD</code>. Hourly predictions are used for forecast playback; six-minute predictions are used for the recent sea-level anomaly residual calculation.</dd>
               <dt>&eta;<sub>obs</sub></dt>
-              <dd>Observed NOAA CO-OPS water level in MLLW from the <code>water_level</code> product at the nearest tide station, used only for the recent observed-minus-predicted residual estimate.</dd>
+              <dd>Observed NOAA CO-OPS water level in NAVD88 from the <code>water_level</code> product at the nearest tide station, requested from the CO-OPS API with <code>datum=NAVD</code> and used only for the recent observed-minus-predicted residual estimate.</dd>
               <dt>U<sub>10</sub></dt>
-              <dd>NWS gridpoint forecast wind speed at the transect prediction point, loaded from <code>forecastGridData.properties.windSpeed</code> and converted to meters per second for H<sub>chop</sub>.</dd>
+              <dd>10 m wind speed at the transect prediction point. Forecast mode loads NWS gridpoint forecast wind speed from <code>forecastGridData.properties.windSpeed</code>. Hindcast mode loads Open-Meteo hourly historical/reanalysis <code>wind_speed_10m</code>. Both sources are converted to meters per second for H<sub>chop</sub>.</dd>
               <dt>prediction latitude and longitude</dt>
-              <dd>Transect forecast point from <code>data/transects.json</code>, used to request the NWS gridpoint forecast and resolve the selected map location.</dd>
+              <dd>Transect forecast point from <code>data/transects.json</code>, used to request the NWS gridpoint forecast, Open-Meteo historical/reanalysis wind, and resolve the selected map location.</dd>
+              <dt>x<sub>pier</sub>, z<sub>pier</sub></dt>
+              <dd>Optional pier deck profile points from <code>data/pier_transects/{transect}.csv</code> when available. The CSV uses <code>x</code> as horizontal distance offshore from the shoreline and <code>z</code> as deck elevation in NAVD88.</dd>
             </dl>
           </article>
           <article class="manual-source-group">
             <h3>User-edited geometry and anomaly variables</h3>
-            <p>These variables are editable in the Geometry Editor. Initial geometry values are seeded from <code>data/forecast-manifest.json</code> where transect-specific defaults exist, otherwise from the local generic defaults.</p>
+            <p>These variables are editable in the Geometry Editor. Initial geometry values are seeded first from <code>data/known_transects.csv</code> when the selected transect has surveyed beach-profile values, then from <code>data/forecast-manifest.json</code> where transect-specific defaults exist, otherwise from the local generic defaults.</p>
             <dl class="variable-list">
               <dt>&beta;</dt>
-              <dd>Average beach-face slope over the swash zone from the Geometry Editor <code>averageBeachSlope</code> input. The field is auto-populated as twice the MOP average slope, where the MOP average slope is prediction depth divided by backbeach-to-prediction-point distance, then remains editable.</dd>
+              <dd>Average beach-face slope over the swash zone from the Geometry Editor <code>averageBeachSlope</code> input. When available, this is loaded from the <code>Face Slope</code> column in <code>data/known_transects.csv</code>. Otherwise, the field is auto-populated as twice the MOP average slope, where the MOP average slope is prediction depth divided by backbeach-to-prediction-point distance, then remains editable.</dd>
               <dt>z<sub>toe</sub></dt>
-              <dd>Dune toe, berm, or structure base elevation from the <code>beachElevationBase</code> input.</dd>
+              <dd>Dune toe, berm, or structure base elevation from the <code>beachElevationBase</code> input. When available, this is loaded from the <code>Toe Elevation</code> column in <code>data/known_transects.csv</code>.</dd>
               <dt>W<sub>toe</sub>, W<sub>b</sub></dt>
-              <dd>Flat toe or berm width from the <code>bermWidth</code> input. The same value is used as Park and Cox berm width W<sub>b</sub>.</dd>
+              <dd>Flat toe or berm width from the <code>bermWidth</code> input. When available, this is loaded from the <code>Toe Distance</code> column in <code>data/known_transects.csv</code>. The same value is used as Park and Cox berm width W<sub>b</sub>.</dd>
               <dt>z<sub>crest</sub></dt>
-              <dd>Dune, berm, or structure crest elevation from the <code>duneCrestElevation</code> input.</dd>
+              <dd>Dune, berm, or structure crest elevation from the <code>duneCrestElevation</code> input. When available, this is loaded from the <code>Crest Elevation</code> column in <code>data/known_transects.csv</code>.</dd>
               <dt>W<sub>toe-crest</sub></dt>
-              <dd>Horizontal distance from toe/base to crest from the <code>toeToCrestDistance</code> input.</dd>
+              <dd>Horizontal distance from toe/base to crest from the <code>toeToCrestDistance</code> input. When available, this is loaded from the <code>Crest Distance</code> column in <code>data/known_transects.csv</code>.</dd>
               <dt>profile mode</dt>
               <dd>User toggle that selects dune geometry, which descends landward to z<sub>toe</sub>, or structure geometry, which remains at z<sub>crest</sub> landward of the crest.</dd>
               <dt>A<sub>SL</sub></dt>
@@ -149,7 +151,7 @@
               <dt>&eta;(t), &eta;</dt>
               <dd>Still-water level used by the runup formulas, computed as NOAA tide prediction plus A<sub>SL</sub> at the selected playback time.</dd>
               <dt>H<sub>chop</sub>, H<sub>total</sub></dt>
-              <dd>Local short-period chop height derived from NWS wind speed, and total wave-height proxy H<sub>swell</sub> + H<sub>chop</sub>.</dd>
+              <dd>Local short-period chop height derived from the active wind-speed source, and total wave-height proxy H<sub>swell</sub> + H<sub>chop</sub>.</dd>
               <dt>L<sub>s</sub>, L<sub>o</sub>, k, n<sub>s</sub></dt>
               <dd>Shallow-water wavelength, deep-water wavelength, wavenumber, and group factor computed from T<sub>p</sub>, d, and g.</dd>
               <dt>ang<sub>s</sub>, ang<sub>d</sub>, K<sub>s</sub>, K<sub>r</sub>, H<sub>o</sub></dt>
@@ -179,8 +181,8 @@
               <dd>Numerically floored H<sub>o</sub> and L<sub>o</sub> values, and the Iribarren-style term used by the Park and modified Stockdon calculations.</dd>
               <dt>&gamma;<sub>&theta;</sub></dt>
               <dd>Oblique-wave reduction factor from the formulas sheet. It is documented for completeness but inactive in the current non-directional runup path.</dd>
-              <dt>R<sub>mean</sub>, s<sub>R</sub>, &Delta;H</dt>
-              <dd>Mean of the three central runup estimates, sample standard deviation of the five runup estimates, and local chop uncertainty allowance H<sub>chop</sub>/2.</dd>
+              <dt>R<sub>mean</sub>, s<sub>R</sub>, F<sub>LP</sub>, &Delta;H</dt>
+              <dd>Mean of the three central runup estimates, sample standard deviation of the five runup estimates, long period swell uncertainty factor, and local chop uncertainty allowance H<sub>chop</sub>/2.</dd>
               <dt>Expected, Conservative, Upper Bound, z<sub>crest,max</sub></dt>
               <dd>Displayed summary water levels at the selected playback time, all computed by the browser from the variables above.</dd>
             </dl>
@@ -238,11 +240,11 @@
                 A<sub>SL</sub> = mean(&eta;<sub>obs</sub> - &eta;<sub>pred</sub>)<br>
                 &eta;(t) = &eta;<sub>NOAA,pred</sub>(t) + A<sub>SL</sub>
               </div>
-              <p>The Explorer uses the nearest NOAA tide station, MLLW datum, and a three-day lookback ending one hour before the run. Observed water levels are paired to six-minute predictions, with a minimum of 24 paired residuals. If the residual estimate is unavailable, the current sea-level anomaly field value is retained.</p>
+              <p>The Explorer uses the nearest NOAA tide station, NAVD88 datum, and a three-day lookback ending one hour before the run. Observed water levels are paired to six-minute predictions in the same datum, with a minimum of 24 paired residuals. If the residual estimate is unavailable, the current sea-level anomaly field value is retained.</p>
               <p class="equation-ref">Source: current Explorer implementation in <code>app.js</code>.</p>
             </article>
             <article class="equation-card">
-              <h3>Local chop proxy from NWS winds</h3>
+              <h3>Local chop proxy from wind speed</h3>
               <div class="equation-math">
                 H<sub>chop</sub>(U<sub>10</sub>; T<sub>c</sub>) =
                 0.241 (U<sub>10</sub><sup>2</sup> / g)
@@ -250,7 +252,7 @@
                 T<sub>c</sub> = 4 s<br>
                 H<sub>total</sub> = H<sub>swell</sub> + H<sub>chop</sub>
               </div>
-              <p>The Explorer converts the NWS wind-speed forecast to U<sub>10</sub> in m/s, evaluates this short-period Pierson-Moskowitz tail proxy at each playback time, and plots the resulting H<sub>chop</sub> series on the wind panel. Non-positive wind speeds return H<sub>chop</sub> = 0. If NWS wind data are unavailable for a forecast time, the runup calculation uses H<sub>chop</sub> = 0 for that time.</p>
+              <p>The Explorer converts the active wind-speed source to U<sub>10</sub> in m/s, evaluates this short-period Pierson-Moskowitz tail proxy at each playback time, and plots the resulting H<sub>chop</sub> series on the wind panel. Forecast mode uses NWS gridpoint forecast winds. Hindcast mode uses Open-Meteo hourly historical/reanalysis winds. Non-positive or unavailable wind speeds return H<sub>chop</sub> = 0 for that time.</p>
               <p class="equation-ref">Source: <code>Chop Height Proxy Model.pdf</code>; current implementation in <code>app.js</code>.</p>
             </article>
           </div>
@@ -302,12 +304,14 @@
               <h3>Maximum-considered wave crest</h3>
               <div class="equation-math">
                 z<sub>crest,max</sub> = &eta; + H<sub>b</sub> MaxRatio CrestRatio<br>
+                z<sub>splash,max</sub> = &eta; + 2H<sub>b</sub> MaxRatio CrestRatio<br>
                 MaxRatio = 1.3<br>
                 CrestRatio = 0.55
               </div>
               <p>
                 Here &eta; is NOAA tide prediction plus the current sea-level anomaly. The formula sheet treats 1.3 as a representative
                 ratio between maximum-considered wave height and significant wave height, and 0.55 as the FEMA crest fraction of total wave height.
+                Where a matching pier transect file exists, the runup profile also plots z<sub>splash,max</sub> as a thin gray dashed reference line.
               </p>
               <p class="equation-ref">Source: project formulas sheet; implemented in <code>FASTER_MOPS.py</code> and <code>app.js</code>.</p>
             </article>
@@ -375,12 +379,13 @@
               <div class="equation-math">
                 R<sub>mean</sub> = mean(R<sub>2,Stockdon</sub>, R<sub>2,Park,&mu;</sub>, R<sub>2,mod,&mu;</sub>)<br>
                 s<sub>R</sub> = stdev(R<sub>2,Stockdon</sub>, R<sub>2,Park,&mu;</sub>, R<sub>2,Park,&sigma;</sub>, R<sub>2,mod,&mu;</sub>, R<sub>2,mod,&sigma;</sub>)<br>
+                F<sub>LP</sub> = (T<sub>p</sub> / 18 s)<sup>4</sup><br>
                 &Delta;H = (H<sub>total</sub> - H<sub>swell</sub>) / 2 = H<sub>chop</sub> / 2<br>
                 Expected = R<sub>mean</sub><br>
-                Conservative = R<sub>mean</sub> + s<sub>R</sub><br>
-                Upper Bound = R<sub>mean</sub> + s<sub>R</sub> + &Delta;H
+                Conservative = R<sub>mean</sub> + F<sub>LP</sub>s<sub>R</sub><br>
+                Upper Bound = Conservative + &Delta;H
               </div>
-              <p>The upper-bound term uses the difference between total wave height and swell wave height as a simple allowance for local wind-wave or chop uncertainty. In the Explorer, this local chop height is estimated from the NWS wind-speed forecast at each playback time.</p>
+              <p>The long period swell uncertainty factor increases to the fourth power with peak period relative to an 18 s reference period. It is applied to the conservative runup spread to account for potential model error in long-period swell. The upper-bound term then adds the difference between total wave height and swell wave height as a simple allowance for local wind-wave or chop uncertainty. In the Explorer, this local chop height is estimated from the active wind-speed source at each playback time.</p>
               <p class="equation-ref">Source: project formulas sheet; current implementation.</p>
             </article>
             <article class="equation-card">
@@ -402,9 +407,9 @@
         <h2>How to Use the Explorer</h2>
         <ol class="manual-steps">
           <li>Zoom the Selection Map until local transects appear, then click the transect of interest.</li>
-          <li>Use the top-row toggles in the Geometry Editor to choose dune vs structure geometry, Metric vs English display units, and UTC vs Local Time display.</li>
+          <li>Use the top-row toggles in the Geometry Editor to choose dune vs structure geometry, Metric vs English display units, and UTC vs Local Time display. The Explorer opens in English units and Local Time by default.</li>
           <li>Review the auto-estimated average beach-face slope and sea-level anomaly, and edit the profile elevations and distances as needed.</li>
-          <li>Select a transect from the map to automatically download live MOP forecast data and the nearest NOAA tide prediction, then populate the lower playback panels.</li>
+          <li>Select a transect from the map to automatically download live MOP forecast data and the nearest NOAA tide prediction, then populate the lower playback panels. To run a historical window of up to five days, add <code>start_date=MMDDYYYY</code> to the URL, for example <code>?transect=OC400&amp;start_date=08212022</code>. Recent start dates are clipped before the current time rather than blended with forecast data.</li>
           <li>Edit the beach or structure geometry inputs and the runup and overtopping analysis will refresh automatically.</li>
           <li>Use the slider or Play button to move through forecast time and inspect how waves, tides, and runup vary through the event window.</li>
         </ol>
@@ -414,10 +419,10 @@
         <h2>How to Read the Output</h2>
         <ul class="manual-list">
           <li><strong>MOP Wave Forecast:</strong> blue line is significant wave height Hs, red dashed line is peak period Tp.</li>
-          <li><strong>NOAA Tide Prediction:</strong> tide level in MLLW, with the current sea-level anomaly incorporated into the runup metrics.</li>
+          <li><strong>NOAA Tide Prediction:</strong> tide level in NAVD88, with the current sea-level anomaly incorporated into the runup metrics.</li>
           <li><strong>NWS Wind Forecast:</strong> gold line is wind speed and navy dashed line is the local chop-height proxy estimated from that wind speed.</li>
           <li><strong>Playback metrics:</strong> Wave Hs, Local Chop, Peak Period, Tide + Anomaly, Max Crest, Expected 2%, Conservative, and Upper Bound all correspond to the selected slider time.</li>
-          <li><strong>Runup profile:</strong> shows still water, maximum crest, expected runup, conservative runup, and upper-bound runup projected across the edited profile.</li>
+          <li><strong>Runup profile:</strong> shows still water, maximum crest, expected runup, conservative runup, and upper-bound runup projected across the edited profile. Where a matching pier file exists, a thick dark-brown line shows the pier deck elevation profile and a thin gray dashed line shows maximum wave splash-up.</li>
           <li><strong>Category pill:</strong> summarizes whether overtopping is not expected, minor, moderate, or significant, based on comparison with the crest elevation.</li>
         </ul>
       </section>
@@ -425,12 +430,12 @@
       <section class="panel manual-panel">
         <h2>Current Implementation Notes</h2>
         <ul class="manual-list">
-          <li>The Explorer is fully browser-side at runtime. Live MOP forecasts are pulled directly from CDIP THREDDS, NOAA tides and water levels are pulled directly from NOAA CO-OPS, and wind forecasts are pulled directly from the NWS API.</li>
+          <li>The Explorer is fully browser-side at runtime. Live MOP forecasts and historical MOP nowcast/hindcast windows are pulled directly from CDIP THREDDS, NOAA tides and water levels are pulled directly from NOAA CO-OPS, current wind forecasts are pulled directly from the NWS API, and hindcast wind speeds are pulled from the Open-Meteo historical weather API.</li>
           <li>The nearest NOAA tide station is resolved from the California tide-station list included with the web app.</li>
           <li>The average beach-face slope is auto-estimated from MOP transect geometry as two times the MOP average slope: 2 x prediction depth divided by backbeach-to-prediction-point distance. The value is then limited to the model slope range. This is a swash-zone proxy, not a replacement for surveyed foreshore profile data.</li>
           <li>The current live Python and browser code path uses the non-directional baseline during the runup calculation loop, even though the formulas sheet includes directional wave-angle terms and an oblique-wave reduction factor.</li>
-          <li>The sea-level anomaly is auto-estimated from recent NOAA observed-minus-predicted water levels, while local chop is auto-estimated from the NWS wind-speed forecast using the four-second Pierson-Moskowitz short-period proxy documented in the project notes.</li>
-          <li>If no NWS wind interval covers a forecast time, the displayed and modeled local chop value for that time is zero.</li>
+          <li>The sea-level anomaly is auto-estimated from NOAA observed-minus-predicted water levels. Forecast mode uses the recent residual window; hindcast mode uses the selected historical playback window.</li>
+          <li>Local chop is auto-estimated from wind speed using the four-second Pierson-Moskowitz short-period proxy documented in the project notes. If no wind interval covers a playback time, the displayed and modeled local chop value for that time is zero.</li>
           <li>The profile is stylized and parameterized. It is not a direct survey profile unless those parameters have been tuned to represent local conditions.</li>
           <li>If no live MOP forecast is available for a transect, the Explorer falls back to a tide-only preview mode.</li>
         </ul>
