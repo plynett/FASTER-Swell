@@ -1023,7 +1023,7 @@ function refreshComputedResults(params = state.modelParams || sanitizeParams(rea
     transect: state.selectedTransect,
   });
   if (state.tideChart) {
-    state.tideChart.options.plugins.overtoppingBackground = { windows: buildOvertoppingWindows(state.results) };
+    state.tideChart.options.plugins.overtoppingBackground = { windows: buildOvertoppingWindows(state.results, state.selectedTideSeries) };
   }
   state.resultsDirty = false;
   dom.forecastEmptyState.classList.add("hidden");
@@ -2864,7 +2864,7 @@ function renderCharts(forecastDataset, tideSeries, windSeries = null) {
         legend: { display: false },
         tooltip: { callbacks: { title: tooltipTimeTitle } },
         currentTimeLine: { value: state.results?.[state.currentIndex]?.timeMs, color: COLORS.aqua },
-        overtoppingBackground: { windows: buildOvertoppingWindows(state.results || []) },
+        overtoppingBackground: { windows: buildOvertoppingWindows(state.results || [], tideSeries) },
       },
       scales: {
         x: {

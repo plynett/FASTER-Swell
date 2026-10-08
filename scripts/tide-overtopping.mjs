@@ -1,13 +1,41 @@
-const HALF_BAND_WIDTH_MS = 90 * 60 * 1000;
+const DEFAULT_HALF_WIDTH_MS = 30 * 60 * 1000;
+const EXTENDED_HALF_WIDTH_MS = 90 * 60 * 1000;
+const HOUR_MS = 60 * 60 * 1000;
 
-export function buildOvertoppingWindows(results = []) {
+function tideAtTime(tideSeries, targetMs) {
+  const times = tideSeries?.timeMs;
+  const levels = tideSeries?.level;
+  if (!times?.length || !levels || targetMs < times[0] || targetMs > times.at(-1)) return null;
+  let low = 0;
+  let high = times.length;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (times[middle] < targetMs) low = middle + 1;
+    else high = middle;
+  }
+  if (times[low] === targetMs) return Number.isFinite(levels[low]) ? levels[low] : null;
+  const before = low - 1;
+  const gap = times[low] - times[before];
+  // Interpolate hourly NOAA predictions, never extrapolate or bridge missing hours.
+  if (!(gap > 0 && gap <= HOUR_MS) || !Number.isFinite(levels[before]) || !Number.isFinite(levels[low])) return null;
+  return levels[before] + (levels[low] - levels[before]) * (targetMs - times[before]) / gap;
+}
+
+export function buildOvertoppingWindows(results = [], tideSeries = null) {
   const windows = results
     .filter((result) => Number.isFinite(result.timeMs) && result.category?.rank > 0)
-    .map((result) => ({
-      start: result.timeMs - HALF_BAND_WIDTH_MS,
-      end: result.timeMs + HALF_BAND_WIDTH_MS,
-      rank: result.category.rank >= 2 ? 2 : 1,
-    }));
+    .map((result) => {
+      const current = tideAtTime(tideSeries, result.timeMs);
+      const before = tideAtTime(tideSeries, result.timeMs - DEFAULT_HALF_WIDTH_MS);
+      const after = tideAtTime(tideSeries, result.timeMs + DEFAULT_HALF_WIDTH_MS);
+      const extendBefore = current !== null && before !== null && before > current;
+      const extendAfter = current !== null && after !== null && after > current;
+      return {
+        start: result.timeMs - (extendBefore ? EXTENDED_HALF_WIDTH_MS : DEFAULT_HALF_WIDTH_MS),
+        end: result.timeMs + (extendAfter ? EXTENDED_HALF_WIDTH_MS : DEFAULT_HALF_WIDTH_MS),
+        rank: result.category.rank >= 2 ? 2 : 1,
+      };
+    });
   const times = [...new Set(windows.flatMap((window) => [window.start, window.end]))].sort((a, b) => a - b);
   const bands = [];
   for (let index = 0; index < times.length - 1; index++) {
