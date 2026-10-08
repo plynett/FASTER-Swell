@@ -119,7 +119,11 @@
           </article>
           <article class="manual-source-group">
             <h3>User-edited geometry and anomaly variables</h3>
-            <p>These variables are editable in the Geometry Editor. Initial geometry values are seeded first from <code>data/known_transects.csv</code> when the selected transect has surveyed beach-profile values, then from <code>data/forecast-manifest.json</code> where transect-specific defaults exist, otherwise from the local generic defaults.</p>
+            <p>These variables are editable in the Geometry Editor. Initial geometry priority is surveyed values in <code>data/known_transects.csv</code>, then a valid <code>DEMTransects/&lt;transect&gt;.txt</code> profile, then baseline defaults from <code>data/forecast-manifest.json</code> or generic settings with a MOP-based slope estimate. DEM text files contain five numeric geometry parameters in meters NAVD88 and a dimensionless slope; the Explorer converts the display to the selected units.</p>
+            <p><strong>Set to Default</strong> restores baseline settings without surveyed or DEM overrides. <strong>Set to DEM-Based Transect</strong> and <strong>Set to Surveyed Transect</strong> appear only when those data are available. Selecting either applies its five geometry values and immediately updates the profile and available runup results, retaining the current sea-level anomaly and Dune/Structure mode. The highlighted button identifies the selected source; manual edits clear that highlight. <strong>Inspect DEM terrain</strong> opens available comparison and diagnostic images in a pop-out, including locations where a five-parameter fit could not be determined. Use the survey selector to compare attempts, or the review link for details; use Close or Escape to dismiss it.</p>
+            <p>Terrain inspection does not apply a profile or enable the DEM button. Candidate fits awaiting review remain separate from published geometry. Where measured terrain exists but fitting failed, the image can guide manual geometry edits; where no measured pixels exist, the image reports the source or processing failure. Survey years are shown because older terrain may no longer represent current beach conditions. The static <code>DEMTransects/images.json</code> index references retained images, independently of the optional five-parameter text files. Geometry text files remain in <code>DEMTransects</code>; comparison JPEGs are retrieved from <code>https://celeris.usc.edu/FASTER-Swell/DEMImages/</code>. The main comparison is named <code>&lt;transect&gt;.jpg</code>, and alternate survey images use source-specific suffixes.</p>
+            <p>The OC pilot and expansion now provide 320 experimental DEM profiles for testing. Another 100 fitted candidates exceed the existing Explorer geometry limits and remain inspection-only; values are not clipped to make them load. The remaining unfitted locations retain their diagnostic images. The map uses the original teal for default geometry, purple for an available DEM profile, and magenta for an available surveyed profile. Surveyed availability takes precedence. Colors describe available data, not the currently applied or manually edited geometry; selection and hover use thicker lines.</p>
+            <p>The OC399 DEM profile is an experimental 2023-lidar baseline, not a surveyed replacement. Its toe lies on measured terrain and is constrained to 2-3 m NAVD88; its slope connects the last measured 1 m crossing before the toe to that toe. The measured elevated-berm midpoint provides a crest reference; the Gaussian peak position is then fitted to the ocean-facing slope while its elevation is fixed. The landward terrain does not contribute to the fitting error. Inspect the matching comparison image and survey year before using any DEM alternative.</p>
             <dl class="variable-list">
               <dt>&beta;</dt>
               <dd>Average beach-face slope over the swash zone from the Geometry Editor <code>averageBeachSlope</code> input. When available, this is loaded from the <code>Face Slope</code> column in <code>data/known_transects.csv</code>. Otherwise, the field is auto-populated as twice the MOP average slope, where the MOP average slope is prediction depth divided by backbeach-to-prediction-point distance, then remains editable.</dd>
@@ -128,7 +132,7 @@
               <dt>W<sub>toe</sub>, W<sub>b</sub></dt>
               <dd>Flat toe or berm width from the <code>bermWidth</code> input. When available, this is loaded from the <code>Toe Distance</code> column in <code>data/known_transects.csv</code>. The same value is used as Park and Cox berm width W<sub>b</sub>.</dd>
               <dt>z<sub>crest</sub></dt>
-              <dd>Dune, berm, or structure crest elevation from the <code>duneCrestElevation</code> input. When available, this is loaded from the <code>Crest Elevation</code> column in <code>data/known_transects.csv</code>.</dd>
+              <dd>Dune, berm, or structure crest elevation from the <code>duneCrestElevation</code> input. The crest may equal the toe elevation, but cannot be lower; no minimum elevation gap is required. When available, this is loaded from the <code>Crest Elevation</code> column in <code>data/known_transects.csv</code>.</dd>
               <dt>W<sub>toe-crest</sub></dt>
               <dd>Horizontal distance from toe/base to crest from the <code>toeToCrestDistance</code> input. When available, this is loaded from the <code>Crest Distance</code> column in <code>data/known_transects.csv</code>.</dd>
               <dt>profile mode</dt>
@@ -393,10 +397,12 @@
               <div class="equation-math">
                 If Expected &gt; z<sub>crest</sub> : Significant overtopping probable<br>
                 Else if Conservative &gt; z<sub>crest</sub> : Moderate overtopping possible<br>
-                Else if Upper Bound &gt; z<sub>crest</sub> : Minor overtopping possible<br>
+                Else if Upper Bound &gt; z<sub>crest</sub> or Spectral-Weighted elevation &gt; z<sub>crest</sub> : Minor overtopping possible<br>
+                Else if flat berm width &gt; 10 ft (3.048 m) and any finite runup elevation &gt; toe elevation : Possible Lower Beach Overwash<br>
                 Else : Overtopping not expected
               </div>
-              <p>This is the decision logic that drives the category pill in the Runup Output panel.</p>
+              <p>This is the decision logic that drives the category pill in the Runup Output panel. Minor overtopping is possible when either the Upper Bound or Spectral-Weighted elevation exceeds the crest, but Conservative does not. Significant and Moderate categories take precedence. An elevation equal to the crest does not trigger exceedance; unavailable spectral elevations are ignored.</p>
+              <p><strong>Possible Lower Beach Overwash</strong> applies only at times with no crest overtopping, where Distance from Swash to Dune/Structure Toe is strictly greater than 10 feet (3.048 meters), and Expected, Conservative, Upper Bound, or Spectral-Weighted runup elevation is strictly above the toe elevation. These elevations already include tide and anomaly; neither is added again. Equality at either threshold does not trigger the warning. Maximum crest and splash-up are not runup metrics for this check. The warning appears in the selected-time figure title and in the forecast summary if no higher overtopping category occurs. It remains a no-crest-overtopping condition and does not add tide-panel shading.</p>
               <p class="equation-ref">Source: current Explorer implementation in <code>app.js</code>.</p>
             </article>
           </div>
@@ -412,7 +418,35 @@
           <li>Select a transect from the map to automatically download live MOP forecast data and the nearest NOAA tide prediction, then populate the lower playback panels. To run a historical window of up to five days, add <code>start_date=MMDDYYYY</code> to the URL, for example <code>?transect=OC400&amp;start_date=08212022</code>. Recent start dates are clipped before the current time rather than blended with forecast data.</li>
           <li>Edit the beach or structure geometry inputs and the runup and overtopping analysis will refresh automatically.</li>
           <li>Use the slider or Play button to move through forecast time and inspect how waves, tides, and runup vary through the event window.</li>
+          <li>The tide curve stays green throughout. Translucent background bands indicate overtopping: yellow for Minor and red for Moderate or Significant, with no shading when overtopping is not indicated. Each band spans one hour centered on its forecast time (30 minutes before and after) and the full vertical plot height, behind the curve. Overlapping windows use the more severe color. Bands are clipped to the displayed time range; these are visual windows around model samples, not independently predicted event durations. Shading updates automatically with geometry changes. A tide-only preview without wave data has no overtopping assessment or shading.</li>
         </ol>
+      </section>
+
+      <section class="panel manual-panel">
+        <h2>Discrete Amplitude Spectrum</h2>
+        <p>The Wave/Tide panel includes a period spectrum synchronized with the selected forecast time. CDIP frequency-band variance is redistributed into one-second period bins centered on integer periods. For example, the 12-second bin covers 11.5 to 12.5 seconds. Energy density is treated as constant within each source frequency band.</p>
+        <div class="equation-math">
+          f<sub>j,min</sub> = 1 / (T<sub>j</sub> + 0.5 s), &nbsp; f<sub>j,max</sub> = 1 / (T<sub>j</sub> - 0.5 s)<br>
+          V<sub>j</sub> = &sum;<sub>i</sub> E<sub>i</sub> &Delta;f<sub>i</sub> &times; overlap([f<sub>i,min</sub>, f<sub>i,max</sub>], [f<sub>j,min</sub>, f<sub>j,max</sub>]) / (f<sub>i,max</sub> - f<sub>i,min</sub>)<br>
+          a<sub>j</sub> = &radic;(2 V<sub>j</sub>), &nbsp; H<sub>s,reconstructed</sub> = 4 &radic;(&sum;<sub>j</sub> V<sub>j</sub>)
+        </div>
+        <p>Here E is CDIP variance spectral density in m&sup2;/Hz, &Delta;f is the supplied bandwidth in Hz, and overlap is the overlapping frequency width. Each bar is an equivalent sinusoidal component amplitude in meters or feet. These amplitudes are not significant wave heights; their variances add. Lighter edge bins are only partially covered by the source spectrum. The vertical scale stays fixed for the loaded forecast, allowing amplitudes to be compared during playback.</p>
+        <p>The spectrum display shows the 5 to 25 second bins; the spectral-weighted runup calculation uses all available bins, including partially covered edge bins. Spectra failing CDIP quality checks or containing missing energy values are marked unavailable. The bulk-wave runup calculation remains unchanged.</p>
+        <p class="equation-ref">Source spectral definitions: <a href="https://cdip.ucsd.edu/MOP_v1.1/MOP_netCDF.txt">CDIP MOP output specification</a>. Conversion: variance-preserving allocation to period bins with a&sup2;/2 equal to bin variance.</p>
+      </section>
+
+      <section class="panel manual-panel">
+        <h2>Spectral-Weighted Runup (Experimental)</h2>
+        <p>For each one-second period bin, the Explorer evaluates the Expected runup approach using the bin center period T<sub>j</sub> and wave height H<sub>j</sub> = 2a<sub>j</sub>. It uses the mean of the Stockdon, Park mean-berm, and modified Stockdon mean-berm predictions, with the same prediction depth, beach geometry, still-water elevation, and inverse shoaling as the bulk-wave calculation. No standard deviation or long-period uncertainty multiplier is added. Period still enters the underlying wavelength and runup equations.</p>
+        <div class="equation-math">
+          H<sub>j</sub> = 2a<sub>j</sub><br>
+          r<sub>j</sub> = mean(r<sub>Stockdon,j</sub>, r<sub>Park,&mu;,j</sub>, r<sub>modified,&mu;,j</sub>)<br>
+          r<sub>spectral</sub> = &radic;(&sum;<sub>j</sub> r<sub>j</sub><sup>2</sup>)<br>
+          z<sub>plotted</sub> = NOAA tide + sea-level anomaly + r<sub>spectral</sub>
+        </div>
+        <p>The wave-only equations return a runup height for each bin directly; no tide or anomaly is added to or subtracted from those outputs. The spectral helper combines those heights into r<sub>spectral</sub>. The Explorer then adds tide and anomaly once to obtain the plotted elevation. Actual water level still affects the model's beach/dune geometry response; this is separate from the elevation offset. Zero-energy bins contribute zero. Positive-height bins retain the existing model's 0.05 m inverse-shoaled-height safeguard. Wind-derived chop is not included in this spectral combination because it is not part of the CDIP amplitude spectrum.</p>
+        <p>The magenta dotted line updates with the selected time and geometry. It is omitted when valid spectra are unavailable. This is an experimental combination, not a separately validated R2% forecast method. It does not replace the existing expected, conservative, or upper-bound calculations. A spectral elevation exceeding the crest can trigger Minor overtopping possible when the Conservative elevation does not exceed the crest; Significant and Moderate categories still take precedence.</p>
+        <p class="equation-ref">Basis: the existing Stockdon, Park and Cox, and modified Stockdon Expected ensemble described above; the spectral root-sum-square combination is a project-specific experimental extension.</p>
       </section>
 
       <section class="panel manual-panel">
@@ -420,10 +454,12 @@
         <ul class="manual-list">
           <li><strong>MOP Wave Forecast:</strong> blue line is significant wave height Hs, red dashed line is peak period Tp.</li>
           <li><strong>NOAA Tide Prediction:</strong> tide level in NAVD88, with the current sea-level anomaly incorporated into the runup metrics.</li>
+          <li><strong>Discrete Amplitude Spectrum:</strong> CDIP swell component amplitudes in one-second period bins at the selected slider time, with the largest bin highlighted in teal. This spectrum excludes the separately calculated wind-derived chop.</li>
           <li><strong>NWS Wind Forecast:</strong> gold line is wind speed and navy dashed line is the local chop-height proxy estimated from that wind speed.</li>
           <li><strong>Playback metrics:</strong> Wave Hs, Local Chop, Peak Period, Tide + Anomaly, Max Crest, Expected 2%, Conservative, and Upper Bound all correspond to the selected slider time.</li>
           <li><strong>Runup profile:</strong> shows still water, maximum crest, expected runup, conservative runup, and upper-bound runup projected across the edited profile. Where a matching pier file exists, a thick dark-brown line shows the pier deck elevation profile and a thin gray dashed line shows maximum wave splash-up.</li>
-          <li><strong>Category pill:</strong> summarizes whether overtopping is not expected, minor, moderate, or significant, based on comparison with the crest elevation.</li>
+          <li><strong>Spectral-Weighted Runup:</strong> magenta dotted line is the experimental root-sum-square combination of per-period conservative runup rises, plus still water once.</li>
+          <li><strong>Category pill:</strong> summarizes the highest overtopping category in the displayed forecast window, including spectral-triggered Minor overtopping. If there is no crest overtopping, it reports Possible Lower Beach Overwash when that condition occurs. The figure title reports the condition at the selected time.</li>
         </ul>
       </section>
 

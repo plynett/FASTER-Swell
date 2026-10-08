@@ -1,3 +1,12 @@
+import { parseDap2NumericArray, parseDap2Matrix, buildForecastAmplitudeSpectra } from "./scripts/period-spectrum.mjs";
+import { computeSpectralWeightedRunup } from "./scripts/spectral-runup.mjs";
+import { buildOvertoppingWindows, overtoppingBackgroundPlugin } from "./scripts/tide-overtopping.mjs";
+import { createDemProfileLoader, createDemImageLoader, createDemCatalogLoader, preferredProfileSource, transectAvailabilitySource, TRANSECT_SOURCE_COLORS } from "./scripts/dem-profiles.mjs";
+
+const loadDemCatalog = createDemCatalogLoader();
+const loadDemProfile = createDemProfileLoader(fetch, loadDemCatalog);
+const loadDemImages = createDemImageLoader();
+
 const DEMO_LABEL = "OC400";
 const TRANSECT_QUERY_PARAM = "transect";
 const START_DATE_QUERY_PARAM = "start_date";
@@ -13,8 +22,8 @@ const DISPLAY_VERTICAL_DATUM = "NAVD88";
 const NWS_POINTS_BASE_URL = "https://api.weather.gov/points";
 const OPEN_METEO_HISTORICAL_URL = "https://archive-api.open-meteo.com/v1/archive";
 const CDIP_DAP2_ASCII_BASE_URL = "https://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/model/MOP_alongshore";
-const CDIP_DAP2_ASCII_QUERY = "waveTime,waveHs,waveTp,waveDp,metaWaterDepth,metaShoreNormal";
-// Optional fallback API route provided by web/scripts/serve_faster_web.py when that proxy is running.
+const CDIP_DAP2_ASCII_QUERY = "waveTime,waveHs,waveTp,waveDp,metaWaterDepth,metaShoreNormal,waveFrequency,waveFrequencyBounds,waveBandwidth,waveEnergyDensity,waveFlagPrimary,waveFrequencyFlagPrimary";
+// Optional local fallback from the offline scripts/serve_faster_web.py tool; not required for static hosting.
 const LIVE_MOP_API_PATH = "./api/mop-forecast";
 const NOAA_APPLICATION_ID = "FASTER_Swell_Web";
 const TRANSECT_HIT_WEIGHT_MULTIPLIER = 3.2;
@@ -59,6 +68,7 @@ const COLORS = {
   blue: "#2563eb",
   green: "#159f91",
   red: "#cc4b37",
+  spectral: "#b03a78",
   yellow: "#c6a023",
   black: "#1f2937",
   pierDeck: "#5b3a1e",
@@ -73,6 +83,11 @@ const state = {
   transects: [],
   genericDefaults: null,
   knownTransectProfiles: new Map(),
+  demProfileCatalog: {},
+  selectedDemProfile: null,
+  selectedDemImages: [],
+  profileSource: "default",
+  geometryRevision: 0,
   hindcastWindow: null,
   selectedTransect: null,
   selectedDatasetMeta: null,
@@ -102,6 +117,7 @@ const state = {
   waveChart: null,
   tideChart: null,
   windChart: null,
+  spectrumChart: null,
   lockedTopRowHeight: null,
   topRowHeightFrame: null,
   displayUnits: "english",
@@ -121,6 +137,15 @@ const dom = {
   unitModeControl: document.getElementById("unitModeControl"),
   timeModeControl: document.getElementById("timeModeControl"),
   resetDefaultsButton: document.getElementById("resetDefaultsButton"),
+  demProfileButton: document.getElementById("demProfileButton"),
+  surveyedProfileButton: document.getElementById("surveyedProfileButton"),
+  demComparisonLink: document.getElementById("demComparisonLink"),
+  demComparisonDialog: document.getElementById("demComparisonDialog"),
+  demComparisonTitle: document.getElementById("demComparisonTitle"),
+  demComparisonImage: document.getElementById("demComparisonImage"),
+  demComparisonSource: document.getElementById("demComparisonSource"),
+  demComparisonNote: document.getElementById("demComparisonNote"),
+  demComparisonReview: document.getElementById("demComparisonReview"),
   runStatusPill: document.getElementById("runStatusPill"),
   forecastEmptyState: document.getElementById("forecastEmptyState"),
   forecastContent: document.getElementById("forecastContent"),
@@ -129,6 +154,9 @@ const dom = {
   waveCanvas: document.getElementById("waveChartCanvas"),
   tideCanvas: document.getElementById("tideChartCanvas"),
   windCanvas: document.getElementById("windChartCanvas"),
+  spectrumCanvas: document.getElementById("spectrumChartCanvas"),
+  spectrumChartTitle: document.getElementById("spectrumChartTitle"),
+  spectrumTimeLabel: document.getElementById("spectrumTimeLabel"),
   waveChartTitle: document.getElementById("waveChartTitle"),
   tideChartTitle: document.getElementById("tideChartTitle"),
   windChartTitle: document.getElementById("windChartTitle"),
@@ -234,7 +262,7 @@ const emptyStateMessagePlugin = {
   },
 };
 
-Chart.register(currentTimeLinePlugin, emptyStateMessagePlugin);
+Chart.register(currentTimeLinePlugin, emptyStateMessagePlugin, overtoppingBackgroundPlugin);
 
 const DEFAULT_FIGURE_RATIO = 940 / 350;
 const FIXED_AXIS_WIDTH = 66;
@@ -248,16 +276,18 @@ init().catch((error) => {
 async function init() {
   setAppStatus("Loading transects, manifests, and NOAA station metadata...");
 
-  const [manifest, transectPayload, knownTransectsCsv] = await Promise.all([
+  const [manifest, transectPayload, knownTransectsCsv, demCatalog] = await Promise.all([
     fetchJSON("./data/forecast-manifest.json"),
     fetchJSON("./data/transects.json"),
     fetchOptionalText(KNOWN_TRANSECTS_CSV_URL),
+    loadDemCatalog(),
   ]);
 
   state.manifest = manifest;
   state.transects = transectPayload.transects;
   state.genericDefaults = manifest.genericDefaults || transectPayload.genericDefaults;
   state.knownTransectProfiles = parseKnownTransectProfiles(knownTransectsCsv);
+  state.demProfileCatalog = demCatalog;
   state.hindcastWindow = getHindcastWindowFromLocation();
   state.tideStationsPromise = fetchCaliforniaTideStations();
 
@@ -395,16 +425,17 @@ function bindControls() {
     });
   });
 
-  dom.resetDefaultsButton.addEventListener("click", () => {
-    if (!state.selectedTransect) {
-      return;
-    }
-    applyModelParams(getDefaultsForTransect(state.selectedTransect));
-    syncAverageBeachSlopeInputTitle(state.selectedTransect);
-    if (state.selectedForecast && state.selectedTideSeries) {
-      refreshComputedResults();
-    }
+  dom.resetDefaultsButton.addEventListener("click", () => applyProfileSource("default"));
+  dom.demProfileButton.addEventListener("click", () => applyProfileSource("dem"));
+  dom.surveyedProfileButton.addEventListener("click", () => applyProfileSource("surveyed"));
+  dom.demComparisonLink.addEventListener("click", (event) => {
+    if (!state.selectedDemImages.length || dom.demComparisonLink.classList.contains("hidden")) return;
+    event.preventDefault();
+    dom.demComparisonTitle.textContent = `${state.selectedTransect.label} DEM terrain inspection`;
+    showDemInspection(Number(dom.demComparisonSource.value));
+    dom.demComparisonDialog.showModal();
   });
+  dom.demComparisonSource.addEventListener("change", () => showDemInspection(Number(dom.demComparisonSource.value)));
 
   dom.timeSlider.addEventListener("input", () => {
     if (!state.results) {
@@ -492,6 +523,21 @@ async function selectTransect(transect, options = {}) {
   state.selectionRequestId = selectionRequestId;
   stopPlayback();
   state.selectedTransect = transect;
+  state.selectedDemProfile = null;
+  state.selectedDemImages = [];
+  state.geometryRevision = 0;
+  state.profileSource = preferredProfileSource(getKnownTransectProfile(transect), null);
+  dom.demComparisonDialog.close();
+  dom.demComparisonImage.removeAttribute("src");
+  dom.demComparisonLink.classList.add("hidden");
+  dom.demComparisonLink.removeAttribute("href");
+  syncProfileSourceControls();
+  const demProfilePromise = loadDemProfile(transect.label);
+  void loadDemImages(transect.label).then(images => {
+    if (isSelectionRequestStale(selectionRequestId, transect.label)) return;
+    state.selectedDemImages.push(...images.filter(image => !state.selectedDemImages.some(entry => entry.imageUrl === image.imageUrl)));
+    syncDemInspection(selectionRequestId, transect.label);
+  });
   state.selectedDatasetMeta = state.manifest.datasets[transect.label] || null;
   state.results = null;
   state.selectedForecast = null;
@@ -508,6 +554,8 @@ async function selectTransect(transect, options = {}) {
   dom.waveChartTitle.textContent = `MOP Wave Forecast - Transect ${transect.label}`;
   dom.tideChartTitle.textContent = "NOAA Tide Prediction";
   dom.windChartTitle.textContent = "NWS Wind Forecast";
+  dom.spectrumChartTitle.textContent = `Discrete Amplitude Spectrum - Transect ${transect.label}`;
+  dom.spectrumTimeLabel.textContent = "--";
   dom.dataAvailabilityPill.textContent = state.hindcastWindow
     ? "CDIP hindcast ready"
     : state.selectedDatasetMeta
@@ -535,7 +583,7 @@ async function selectTransect(transect, options = {}) {
   dom.categoryPill.style.color = "#7a5413";
   syncSelectedTransectUrl(transect.label);
 
-  const defaults = getDefaultsForTransect(transect);
+  const defaults = sanitizeParams({ ...getDefaultsForTransect(transect), ...getKnownTransectProfile(transect) });
   applyModelParams(defaults);
   syncAverageBeachSlopeInputTitle(transect);
   updateGeometryPreview();
@@ -548,9 +596,23 @@ async function selectTransect(transect, options = {}) {
     });
   }
 
-  const tideStation = await resolveTideStation(transect);
+  const [tideStation, demProfile] = await Promise.all([resolveTideStation(transect), demProfilePromise]);
   if (isSelectionRequestStale(selectionRequestId, transect.label)) {
     return;
+  }
+  state.selectedDemProfile = demProfile;
+  if (demProfile) state.demProfileCatalog[transect.label] = demProfile;
+  else delete state.demProfileCatalog[transect.label];
+  syncVisibleTransects();
+  if (state.geometryRevision === 0) {
+    applyProfileSource(preferredProfileSource(getKnownTransectProfile(transect), demProfile), { automatic: true });
+  } else {
+    syncProfileSourceControls();
+  }
+  if (demProfile) {
+    state.selectedDemImages = state.selectedDemImages.filter(entry => entry.imageUrl !== demProfile.imageUrl);
+    state.selectedDemImages.unshift({ ...demProfile, hasFit: true, published: true });
+    syncDemInspection(selectionRequestId, transect.label);
   }
   state.selectedTideStation = tideStation;
   dom.tideChartTitle.textContent = formatTideChartTitle(tideStation);
@@ -558,6 +620,51 @@ async function selectTransect(transect, options = {}) {
     selectionRequestId,
     tideStation,
   });
+}
+
+function showDemInspection(index = 0) {
+  const entry = state.selectedDemImages[index];
+  if (!entry) return;
+  dom.demComparisonImage.src = entry.imageUrl;
+  dom.demComparisonImage.alt = `${state.selectedTransect.label}: ${entry.hasFit ? "terrain and fitted profile" : "terrain inspection; no usable fit"}`;
+  dom.demComparisonNote.textContent = entry.published
+    ? `${entry.experimental ? `Experimental ${entry.year} DEM profile enabled for testing; not validated current terrain.` : "Comparison for the available DEM-based profile."} Surveyed profiles still take priority.${entry.flags?.length ? ` Review flags: ${entry.flags.join(", ").replaceAll("_", " ")}.` : ""}`
+    : `${entry.year ? `Historical ${entry.year} terrain. ` : ""}${entry.hasFit ? "Candidate fit for inspection only; not applied to the Explorer." : entry.hasTerrain ? "No usable five-parameter fit. Use this image to guide manual geometry edits." : "No sampled terrain available. This image documents the source/processing failure, not a measured profile."}${entry.failure ? ` ${entry.failure}` : ""}`;
+  dom.demComparisonReview.classList.toggle("hidden", !entry.reviewUrl);
+  if (entry.reviewUrl) dom.demComparisonReview.href = entry.reviewUrl;
+  else dom.demComparisonReview.removeAttribute("href");
+}
+
+function syncDemInspection(selectionRequestId, label) {
+  const entries = state.selectedDemImages;
+  const version = entries.slice();
+  const openImageIndex = dom.demComparisonDialog.open
+    ? entries.findIndex(entry => entry.imageUrl === dom.demComparisonImage.getAttribute("src")) : -1;
+  dom.demComparisonSource.replaceChildren(...entries.map((entry, index) => {
+    const option = document.createElement("option");
+    option.value = String(index);
+    option.textContent = entry.published ? `Available DEM profile${entry.year ? ` (${entry.year}, experimental)` : ""}` : `${entry.year || "No terrain"} | ${entry.source} | ${entry.hasFit ? "candidate fit" : "no fit"}`;
+    return option;
+  }));
+  // Fall back to a staged image if a legacy parameter file has no JPEG.
+  const probe = (index) => {
+    if (index >= entries.length) return;
+    const preview = new Image();
+    const stale = () => isSelectionRequestStale(selectionRequestId, label) ||
+      version.length !== state.selectedDemImages.length || version.some((entry, i) => entry !== state.selectedDemImages[i]);
+    preview.onload = () => {
+      if (stale()) return;
+      dom.demComparisonSource.value = String(index);
+      dom.demComparisonLink.href = entries[index].imageUrl;
+      dom.demComparisonLink.textContent = "Inspect DEM terrain";
+      dom.demComparisonLink.classList.remove("hidden");
+      if (dom.demComparisonDialog.open) showDemInspection(index);
+      scheduleTopRowHeightCapture();
+    };
+    preview.onerror = () => { if (!stale()) probe(index + 1); };
+    preview.src = entries[index].imageUrl;
+  };
+  probe(Math.max(0, openImageIndex));
 }
 
 function getRequestedTransectLabelFromLocation() {
@@ -714,7 +821,8 @@ async function runModel(options = {}) {
 
   const selectionRequestId = options.selectionRequestId ?? state.selectionRequestId;
   const transectLabel = state.selectedTransect.label;
-  let params = sanitizeParams(readModelParamsFromInputs());
+  // Input handlers keep SI state current; formatted display values are rounded.
+  let params = sanitizeParams(state.modelParams || readModelParamsFromInputs());
   applyModelParams(params);
   state.selectedForecast = null;
   state.results = null;
@@ -753,7 +861,7 @@ async function runModel(options = {}) {
       return;
     }
     params = sanitizeParams({
-      ...params,
+      ...(state.modelParams || readModelParamsFromInputs()),
       tideSurgeLevel: anomalyEstimate.anomaly,
     });
     applyModelParams(params);
@@ -883,11 +991,15 @@ async function runModel(options = {}) {
     return;
   }
   renderCharts(forecastDataset, tideSeries, windSeries);
-  refreshComputedResults(sanitizeParams(readModelParamsFromInputs()));
+  refreshComputedResults(sanitizeParams(state.modelParams || readModelParamsFromInputs()));
   scheduleTopRowHeightCapture();
 }
 
 function handleParameterInput() {
+  state.geometryRevision += 1;
+  state.profileSource = "custom";
+  syncProfileSourceControls();
+  syncAverageBeachSlopeInputTitle(state.selectedTransect);
   const params = sanitizeParams(readModelParamsFromInputs());
   state.modelParams = params;
   updateGeometryPreview();
@@ -910,6 +1022,9 @@ function refreshComputedResults(params = state.modelParams || sanitizeParams(rea
     params: state.modelParams,
     transect: state.selectedTransect,
   });
+  if (state.tideChart) {
+    state.tideChart.options.plugins.overtoppingBackground = { windows: buildOvertoppingWindows(state.results) };
+  }
   state.resultsDirty = false;
   dom.forecastEmptyState.classList.add("hidden");
   dom.forecastContent.classList.remove("hidden");
@@ -931,7 +1046,7 @@ function computeRunupResults({ forecastDataset, tideSeries, windSeries, params, 
   return forecastDataset.waveTimeMs.map((timeMs, index) => {
     const tideLevel = findNearestTideLevel(tideSeries, timeMs) + params.tideSurgeLevel;
     const localChopHeight = findIntervalValueAtTime(windSeries?.chopIntervals, timeMs, 0);
-    return computeRunupAtTime({
+    const input = {
       timeMs,
       index,
       waveHeightSwell: forecastDataset.waveHs[index],
@@ -943,7 +1058,26 @@ function computeRunupResults({ forecastDataset, tideSeries, windSeries, params, 
       waterDepthPrediction: forecastDataset.metaWaterDepth,
       shorelineNormal: forecastDataset.metaShoreNormal ?? transect.shoreNormal,
       params,
+    };
+    const bulkRunup = computeRunupAtTime(input);
+    const spectralRunup = computeSpectralWeightedRunup({
+      spectra: forecastDataset.amplitudeSpectra,
+      index,
+      input,
+      predictRunup: computeExpectedRunupHeight,
     });
+    // Add tide plus anomaly once, after combining the spectral runup heights.
+    const spectralWeightedRunup = Number.isFinite(spectralRunup.runupAboveStillWater)
+      ? tideLevel + spectralRunup.runupAboveStillWater
+      : null;
+    const category = classifyOvertopping({
+      ...bulkRunup,
+      spectralWeightedRunup,
+      duneCrestElevation: params.duneCrestElevation,
+      beachElevationBase: params.beachElevationBase,
+      bermWidth: params.bermWidth,
+    });
+    return { ...bulkRunup, spectralWeightedRunup, spectralRunup, category };
   });
 }
 
@@ -988,7 +1122,7 @@ function sanitizeParams(rawParams) {
     : 15;
   const toeToCrestDistance = clampNumber(rawParams.toeToCrestDistance, 0.25, 125, fallbackToeToCrestDistance);
   const duneWidth = toeToCrestDistance * 2;
-  const minCrest = beachElevationBase + 0.1;
+  const minCrest = beachElevationBase;
   const duneCrestElevation = clampNumber(rawParams.duneCrestElevation, minCrest, 20, minCrest);
   const tideSurgeLevel = clampNumber(rawParams.tideSurgeLevel, -2, 4, 0);
 
@@ -1012,13 +1146,37 @@ function getDefaultsForTransect(transectOrLabel) {
   const slopeEstimate = typeof transectOrLabel === "string"
     ? null
     : estimateAverageBeachSlopeFromTransect(transectOrLabel);
-  const knownProfile = getKnownTransectProfile(label);
-  return {
+  return sanitizeParams({
     ...defaults,
     averageBeachSlope: slopeEstimate?.slope ?? defaults.averageBeachSlope,
     toeToCrestDistance: Number.isFinite(duneWidth) ? duneWidth / 2 : 15,
-    ...knownProfile,
-  };
+  });
+}
+
+function applyProfileSource(source, { automatic = false } = {}) {
+  if (!state.selectedTransect) return;
+  const profile = source === "dem" ? state.selectedDemProfile?.params
+    : source === "surveyed" ? getKnownTransectProfile(state.selectedTransect) : null;
+  if (source !== "default" && !profile) return;
+  if (!automatic) state.geometryRevision += 1;
+  state.profileSource = source;
+  const base = source === "default" ? getDefaultsForTransect(state.selectedTransect) : state.modelParams;
+  applyModelParams(sanitizeParams({ ...base, ...profile }));
+  syncProfileSourceControls();
+  syncAverageBeachSlopeInputTitle(state.selectedTransect);
+  if (state.selectedForecast && state.selectedTideSeries) refreshComputedResults();
+}
+
+function syncProfileSourceControls() {
+  const visibilityBefore = [dom.demProfileButton, dom.surveyedProfileButton].map((button) => button.classList.contains("hidden"));
+  dom.demProfileButton.classList.toggle("hidden", !state.selectedDemProfile);
+  dom.surveyedProfileButton.classList.toggle("hidden", !getKnownTransectProfile(state.selectedTransect));
+  for (const [source, button] of [["default", dom.resetDefaultsButton], ["dem", dom.demProfileButton], ["surveyed", dom.surveyedProfileButton]]) {
+    button.setAttribute("aria-pressed", String(state.profileSource === source));
+  }
+  if ([dom.demProfileButton, dom.surveyedProfileButton].some((button, index) => button.classList.contains("hidden") !== visibilityBefore[index])) {
+    scheduleTopRowHeightCapture();
+  }
 }
 
 function getKnownTransectProfile(transectOrLabel) {
@@ -1055,8 +1213,16 @@ function estimateAverageBeachSlopeFromTransect(transect) {
 }
 
 function syncAverageBeachSlopeInputTitle(transect) {
+  if (state.profileSource === "dem") {
+    dom.averageBeachSlopeInput.title = `Loaded from ${state.selectedDemProfile.textUrl}; DEM-derived slope, editable.`;
+    return;
+  }
+  if (state.profileSource === "custom") {
+    dom.averageBeachSlopeInput.title = "User-edited beach profile.";
+    return;
+  }
   const knownProfile = getKnownTransectProfile(transect);
-  if (Number.isFinite(knownProfile?.averageBeachSlope)) {
+  if (state.profileSource === "surveyed" && Number.isFinite(knownProfile?.averageBeachSlope)) {
     dom.averageBeachSlopeInput.title =
       `Loaded from ${KNOWN_TRANSECTS_CSV_URL} for transect ${normalizeTransectLabel(transect?.label)}; edit if updated surveyed profile data are available.`;
     return;
@@ -1214,7 +1380,7 @@ function renderProfileSvg({
       const displayStart = overlay.extendLeftToAxis ? displayXMin : convertDistanceForDisplay(extent.start);
       const displayEnd = convertDistanceForDisplay(extent.end);
       const displayValue = convertElevationForDisplay(overlay.value);
-      return `<line x1="${xScale(displayStart).toFixed(2)}" y1="${yScale(displayValue).toFixed(2)}" x2="${xScale(displayEnd).toFixed(2)}" y2="${yScale(displayValue).toFixed(2)}" stroke="${overlay.color}" stroke-width="${overlay.strokeWidth || 4}" ${overlay.dash ? `stroke-dasharray="${overlay.dash}"` : ""} />`;
+      return `<line data-overlay-label="${escapeHtml(overlay.label)}" data-elevation-m="${overlay.value}" x1="${xScale(displayStart).toFixed(2)}" y1="${yScale(displayValue).toFixed(2)}" x2="${xScale(displayEnd).toFixed(2)}" y2="${yScale(displayValue).toFixed(2)}" stroke="${overlay.color}" stroke-width="${overlay.strokeWidth || 4}" ${overlay.dash ? `stroke-dasharray="${overlay.dash}"` : ""}><title>${escapeHtml(overlay.label)}: ${escapeHtml(formatDisplayLength(overlay.value, 2))}</title></line>`;
     })
     .join("");
   const pierDeckMarkup = displayPierDeckPoints.length >= 2
@@ -1234,7 +1400,7 @@ function renderProfileSvg({
       ...(pierDeckMarkup ? [{ label: "Pier Deck", color: COLORS.pierDeck, dash: "", strokeWidth: 5 }] : []),
     ]
     : [];
-  const legendWidth = 176;
+  const legendWidth = Math.max(176, ...legendItems.map((item) => 62 + item.label.length * 6.5));
   const legendPadding = 12;
   const legendItemGap = 18;
   const legendHeight = legendItems.length ? legendPadding * 2 + legendItems.length * legendItemGap : 0;
@@ -1574,6 +1740,12 @@ function buildThreddsAsciiMopWindowUrl(label, fileSuffix, startIndex, endIndex) 
     `waveDp[${startIndex}:1:${endIndex}]`,
     "metaWaterDepth",
     "metaShoreNormal",
+    "waveFrequency",
+    "waveFrequencyBounds",
+    "waveBandwidth",
+    `waveEnergyDensity[${startIndex}:1:${endIndex}]`,
+    `waveFlagPrimary[${startIndex}:1:${endIndex}]`,
+    "waveFrequencyFlagPrimary",
   ].join(",");
   return `${CDIP_DAP2_ASCII_BASE_URL}/${encodedLabel}_${encodedSuffix}.nc.ascii?${query}`;
 }
@@ -1613,6 +1785,20 @@ function parseDap2AsciiForecast(bodyText, metadata) {
     );
   }
 
+  let spectralData = {};
+  try {
+    spectralData = {
+      waveFrequency: parseDap2AsciiArray(bodyText, "waveFrequency"),
+      waveFrequencyBounds: parseDap2Matrix(bodyText, "waveFrequencyBounds"),
+      waveBandwidth: parseDap2AsciiArray(bodyText, "waveBandwidth"),
+      waveEnergyDensity: parseDap2Matrix(bodyText, "waveEnergyDensity.waveEnergyDensity"),
+      waveFlagPrimary: parseDap2AsciiArray(bodyText, "waveFlagPrimary"),
+      waveFrequencyFlagPrimary: parseDap2AsciiArray(bodyText, "waveFrequencyFlagPrimary"),
+    };
+  } catch (error) {
+    console.warn("[FASTER MOP] Spectral data could not be parsed; retaining bulk forecast.", { label: metadata.label, error });
+  }
+
   return normalizeForecastDataset(
     {
       label: metadata.label,
@@ -1625,6 +1811,7 @@ function parseDap2AsciiForecast(bodyText, metadata) {
       waveDp,
       metaWaterDepth,
       metaShoreNormal,
+      ...spectralData,
     },
     {
       sourceKind: metadata.sourceKind || "live",
@@ -1634,26 +1821,7 @@ function parseDap2AsciiForecast(bodyText, metadata) {
 }
 
 function parseDap2AsciiArray(bodyText, variableName) {
-  const pattern = new RegExp(
-    `(?:^|\\n)${escapeRegex(variableName)}\\[[^\\]]+\\]\\s*([\\s\\S]*?)(?=\\n[A-Za-z][\\w]*\\[[^\\]]+\\]\\s*|\\n[A-Za-z][\\w]*\\s*,|$)`,
-    "m"
-  );
-  const match = bodyText.match(pattern);
-  if (!match) {
-    throw new Error(`CDIP THREDDS response did not include array data for ${variableName}.`);
-  }
-
-  const values = match[1]
-    .split(/[\s,]+/)
-    .map((token) => token.trim())
-    .filter(Boolean)
-    .map((token) => Number(token));
-
-  if (values.some((value) => !Number.isFinite(value))) {
-    throw new Error(`CDIP THREDDS response included non-numeric values for ${variableName}.`);
-  }
-
-  return values;
+  return parseDap2NumericArray(bodyText, variableName).values;
 }
 
 function parseDap2AsciiScalar(bodyText, variableName) {
@@ -1676,11 +1844,18 @@ function escapeRegex(value) {
 }
 
 function normalizeForecastDataset(raw, metadata = {}) {
-  return {
+  const dataset = {
     ...raw,
     ...metadata,
     waveTimeMs: raw.waveTime.map((value) => Date.parse(value.endsWith("Z") ? value : `${value}Z`)),
   };
+  try {
+    dataset.amplitudeSpectra = buildForecastAmplitudeSpectra(dataset);
+  } catch (error) {
+    console.warn("[FASTER MOP] Spectrum conversion failed; retaining bulk forecast.", error);
+    dataset.amplitudeSpectra = { bins: [], frames: [], maxAmplitude: 0, unavailableReason: "Spectral data are invalid or incomplete." };
+  }
+  return dataset;
 }
 
 async function loadTideSeries(stationId, startMs, endMs) {
@@ -2201,7 +2376,7 @@ function findNearestTideLevel(tideSeries, targetMs) {
   return tideSeries.level[bestIndex];
 }
 
-function computeRunupAtTime(input) {
+function evaluateWaveRunupEquations(input) {
   const g = 9.81;
   const slope = input.params.averageBeachSlope;
   const peakPeriod = Math.max(input.peakWavePeriod, 0.1);
@@ -2225,6 +2400,49 @@ function computeRunupAtTime(input) {
   const safeHo = Math.max(Ho, 0.05);
   const safeLo = Math.max(Lo, 0.05);
 
+  const setupStockdon = 1.1 * 0.35 * slope * Math.sqrt(Lo * Ho);
+  const waveRunupStockdon = 1.1 * 0.5 * Math.sqrt(Ho * Lo * (0.563 * slope ** 2 + 0.0004));
+  const stockdonRunupHeight = setupStockdon + waveRunupStockdon;
+
+  const bermCoefficientMean = 0.8 - 0.4 * Math.tanh((2 * input.params.bermWidth) / Lo);
+  const bermCoefficientSigma = 1 - 0.5 * Math.tanh((2 * input.params.bermWidth) / Lo);
+  const betaF = Math.atan(slope);
+  const betaD = Math.atan((input.params.duneCrestElevation - input.params.beachElevationBase) / (0.5 * input.params.duneWidth));
+  const alpha = clamp(((input.tideLevel - input.params.beachElevationBase) + 0.7 * safeHo) / (1.4 * safeHo), 0, 1);
+  const betaT = (1 - alpha) * betaF + alpha * betaD;
+  const shapeRatio = (input.tideLevel - input.params.beachElevationBase) / safeHo;
+  const betaUsed = shapeRatio < -0.7 ? betaF : shapeRatio > 0.7 ? betaD : betaT;
+  const iribarren = Math.tan(betaUsed) / Math.sqrt(safeHo / safeLo);
+
+  const parkRunupHeightMean = 1.35 * bermCoefficientMean * safeHo * iribarren ** 0.65;
+  const parkRunupHeightSigma = 1.35 * bermCoefficientSigma * safeHo * iribarren ** 0.65;
+
+  const setupModified = 1.1 * bermCoefficientMean * 0.35 * Math.tan(betaUsed) * Math.sqrt(safeLo * safeHo);
+  const waveRunupModified = 1.1 * 0.5 * bermCoefficientMean * Math.sqrt(safeHo * safeLo * (0.563 * Math.tanh(betaUsed) ** 2 + 0.0004));
+  const modifiedRunupHeight = setupModified + waveRunupModified;
+
+  const setupModifiedSigma = 1.1 * bermCoefficientSigma * 0.35 * Math.tan(betaUsed) * Math.sqrt(safeLo * safeHo);
+  const waveRunupModifiedSigma = 1.1 * 0.5 * bermCoefficientSigma * Math.sqrt(safeHo * safeLo * (0.563 * Math.tanh(betaUsed) ** 2 + 0.0004));
+  const modifiedRunupHeightSigma = setupModifiedSigma + waveRunupModifiedSigma;
+
+  return {
+    expectedRunupHeight: mean([stockdonRunupHeight, parkRunupHeightMean, modifiedRunupHeight]),
+    runupHeights: [stockdonRunupHeight, parkRunupHeightMean, parkRunupHeightSigma, modifiedRunupHeight, modifiedRunupHeightSigma],
+    Ho,
+    Lo,
+    peakPeriod,
+    angDRad,
+    slope,
+    shallowRelativeAngleDeg,
+  };
+}
+
+function computeExpectedRunupHeight(input) {
+  return evaluateWaveRunupEquations(input).expectedRunupHeight;
+}
+
+function computeRunupAtTime(input) {
+  const { expectedRunupHeight, runupHeights, Ho, Lo, peakPeriod, angDRad, slope, shallowRelativeAngleDeg } = evaluateWaveRunupEquations(input);
   const aCoefficient = 43.75 * (1 - Math.exp(-19 * slope));
   const bCoefficient = 1.56 / (1 + Math.exp(-19.5 * slope));
 
@@ -2242,44 +2460,21 @@ function computeRunupAtTime(input) {
   const maxWaveSplashUp =
     input.tideLevel + 2.0 * breakingSummary.breakingWaveHeight * MAX_WAVE_RATIO * CREST_RATIO;
 
-  const setupStockdon = 1.1 * 0.35 * slope * Math.sqrt(Lo * Ho);
-  const waveRunupStockdon = 1.1 * 0.5 * Math.sqrt(Ho * Lo * (0.563 * slope ** 2 + 0.0004));
-  const stockdonTotal = input.tideLevel + setupStockdon + waveRunupStockdon;
-
-  const bermCoefficientMean = 0.8 - 0.4 * Math.tanh((2 * input.params.bermWidth) / Lo);
-  const bermCoefficientSigma = 1 - 0.5 * Math.tanh((2 * input.params.bermWidth) / Lo);
-  const betaF = Math.atan(slope);
-  const betaD = Math.atan((input.params.duneCrestElevation - input.params.beachElevationBase) / (0.5 * input.params.duneWidth));
-  const alpha = clamp(((input.tideLevel - input.params.beachElevationBase) + 0.7 * safeHo) / (1.4 * safeHo), 0, 1);
-  const betaT = (1 - alpha) * betaF + alpha * betaD;
-  const shapeRatio = (input.tideLevel - input.params.beachElevationBase) / safeHo;
-  const betaUsed = shapeRatio < -0.7 ? betaF : shapeRatio > 0.7 ? betaD : betaT;
-  const iribarren = Math.tan(betaUsed) / Math.sqrt(safeHo / safeLo);
-
-  const parkTotalMean = input.tideLevel + 1.35 * bermCoefficientMean * safeHo * iribarren ** 0.65;
-  const parkTotalSigma = input.tideLevel + 1.35 * bermCoefficientSigma * safeHo * iribarren ** 0.65;
-
-  const setupModified = 1.1 * bermCoefficientMean * 0.35 * Math.tan(betaUsed) * Math.sqrt(safeLo * safeHo);
-  const waveRunupModified = 1.1 * 0.5 * bermCoefficientMean * Math.sqrt(safeHo * safeLo * (0.563 * Math.tanh(betaUsed) ** 2 + 0.0004));
-  const modifiedTotal = input.tideLevel + setupModified + waveRunupModified;
-
-  const setupModifiedSigma = 1.1 * bermCoefficientSigma * 0.35 * Math.tan(betaUsed) * Math.sqrt(safeLo * safeHo);
-  const waveRunupModifiedSigma = 1.1 * 0.5 * bermCoefficientSigma * Math.sqrt(safeHo * safeLo * (0.563 * Math.tanh(betaUsed) ** 2 + 0.0004));
-  const modifiedTotalSigma = input.tideLevel + setupModifiedSigma + waveRunupModifiedSigma;
-
-  const meanRunup = mean([stockdonTotal, parkTotalMean, modifiedTotal]);
-  const runupPredictions = [stockdonTotal, parkTotalMean, parkTotalSigma, modifiedTotal, modifiedTotalSigma];
-  const stdDevRunup = sampleStandardDeviation(runupPredictions);
+  const stdDevRunup = sampleStandardDeviation(runupHeights);
   const waveHeightVariability = Math.max((input.waveHeightTotal - input.waveHeightSwell) / 2, 0);
-  const longPeriodSwellUncertaintyFactor = getLongPeriodSwellUncertaintyFactor(peakPeriod);
-  const expectedRunup = meanRunup;
-  const conservativeRunup = meanRunup + longPeriodSwellUncertaintyFactor * stdDevRunup;
+  const longPeriodSwellUncertaintyFactor = input.applyLongPeriodSwellMultiplier === false
+    ? 1
+    : getLongPeriodSwellUncertaintyFactor(peakPeriod);
+  const expectedRunup = input.tideLevel + expectedRunupHeight;
+  const conservativeRunup = expectedRunup + longPeriodSwellUncertaintyFactor * stdDevRunup;
   const upperBoundRunup = conservativeRunup + waveHeightVariability;
   const category = classifyOvertopping({
     expectedRunup,
     conservativeRunup,
     upperBoundRunup,
     duneCrestElevation: input.params.duneCrestElevation,
+    beachElevationBase: input.params.beachElevationBase,
+    bermWidth: input.params.bermWidth,
   });
 
   return {
@@ -2297,6 +2492,7 @@ function computeRunupAtTime(input) {
     breakingDepth: breakingSummary.breakingDepth,
     breakingWaveHeight: breakingSummary.breakingWaveHeight,
     expectedRunup,
+    expectedRunupHeight,
     conservativeRunup,
     upperBoundRunup,
     stdDevRunup,
@@ -2396,6 +2592,10 @@ function destroyForecastCharts() {
   if (state.windChart) {
     state.windChart.destroy();
     state.windChart = null;
+  }
+  if (state.spectrumChart) {
+    state.spectrumChart.destroy();
+    state.spectrumChart = null;
   }
 }
 
@@ -2549,6 +2749,7 @@ function renderTideOnlyPreview(tideSeries, tideWindow) {
   });
 
   dom.forecastWindowLabel.textContent = `${formatShortDateTime(timeMin)} to ${formatShortDateTime(timeMax)} ${getTimeModeLabel()}`;
+  renderSpectrumChart();
 }
 
 function renderCharts(forecastDataset, tideSeries, windSeries = null) {
@@ -2663,6 +2864,7 @@ function renderCharts(forecastDataset, tideSeries, windSeries = null) {
         legend: { display: false },
         tooltip: { callbacks: { title: tooltipTimeTitle } },
         currentTimeLine: { value: state.results?.[state.currentIndex]?.timeMs, color: COLORS.aqua },
+        overtoppingBackground: { windows: buildOvertoppingWindows(state.results || []) },
       },
       scales: {
         x: {
@@ -2792,6 +2994,86 @@ function renderCharts(forecastDataset, tideSeries, windSeries = null) {
   });
 
   dom.forecastWindowLabel.textContent = `${formatShortDateTime(forecastDataset.waveTimeMs[0])} to ${formatShortDateTime(forecastDataset.waveTimeMs.at(-1))} ${getTimeModeLabel()}`;
+  renderSpectrumChart(forecastDataset);
+}
+
+function getSpectrumDisplayBins(spectra) {
+  return (spectra?.bins || [])
+    .map((bin, sourceIndex) => ({ ...bin, sourceIndex }))
+    .filter((bin) => bin.period >= 5 && bin.period <= 25);
+}
+
+function renderSpectrumChart(forecastDataset = null) {
+  const spectra = forecastDataset?.amplitudeSpectra;
+  const displayBins = getSpectrumDisplayBins(spectra);
+  state.spectrumChart = new Chart(dom.spectrumCanvas, {
+    type: "bar",
+    data: {
+      labels: displayBins.map((bin) => String(bin.period)),
+      datasets: [{ label: "Component amplitude", data: [], borderWidth: 1, categoryPercentage: 0.92, barPercentage: 0.92 }],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: false,
+      layout: { padding: { top: 0, right: 4, bottom: 0, left: 2 } },
+      plugins: {
+        legend: { display: false },
+        emptyStateMessage: { message: "No spectral data available." },
+        tooltip: {
+          callbacks: {
+            title(items) {
+              const bin = displayBins[items[0]?.dataIndex];
+              return bin ? `${bin.periodMin}-${bin.periodMax} s period bin` : "";
+            },
+            label(item) { return `Amplitude: ${item.parsed.y.toFixed(3)} ${state.displayUnits === "english" ? "ft" : "m"}`; },
+            afterLabel(item) { return displayBins[item.dataIndex]?.partialCoverage ? "Partially covered edge bin" : ""; },
+          },
+        },
+      },
+      scales: {
+        x: {
+          title: { display: true, text: "Wave Period (s)" },
+          grid: { display: false },
+          ticks: { maxRotation: 0, autoSkip: true, maxTicksLimit: 24 },
+        },
+        y: {
+          min: 0,
+          max: convertLengthForDisplay(Math.max((spectra?.maxAmplitude || 0) * 1.12, 0.01)),
+          title: { display: true, text: ["Component Amplitude", state.displayUnits === "english" ? "(ft)" : "(m)"], color: COLORS.blue },
+          ticks: { color: COLORS.blue },
+          grid: { color: "rgba(17,49,76,0.08)" },
+          afterFit(axis) { axis.width = FIXED_AXIS_WIDTH; },
+        },
+      },
+    },
+  });
+  updateSpectrumChart(forecastDataset, state.currentIndex);
+}
+
+function updateSpectrumChart(forecastDataset, index) {
+  if (!state.spectrumChart) {
+    return;
+  }
+  const spectra = forecastDataset?.amplitudeSpectra;
+  const frame = spectra?.frames[index];
+  const displayBins = getSpectrumDisplayBins(spectra);
+  const amplitudes = frame?.amplitudes
+    ? displayBins.map((bin) => frame.amplitudes[bin.sourceIndex])
+    : null;
+  dom.spectrumChartTitle.textContent = `Discrete Amplitude Spectrum - Transect ${state.selectedTransect.label}`;
+  const timeMs = forecastDataset?.waveTimeMs[index];
+  dom.spectrumTimeLabel.textContent = Number.isFinite(timeMs) ? `${formatShortDateTime(timeMs)} ${getTimeModeLabel()}` : "--";
+  const dataset = state.spectrumChart.data.datasets[0];
+  dataset.data = amplitudes ? amplitudes.map(convertLengthForDisplay) : [];
+  const peak = amplitudes ? Math.max(...amplitudes) : null;
+  dataset.backgroundColor = displayBins.map((bin, band) => (
+    bin.partialCoverage ? "rgba(37,99,235,0.35)" : amplitudes?.[band] === peak ? COLORS.aqua : COLORS.blue
+  ));
+  dataset.borderColor = COLORS.blue;
+  state.spectrumChart.options.plugins.emptyStateMessage.message =
+    frame?.unavailableReason || spectra?.unavailableReason || "Spectral data unavailable for this forecast.";
+  state.spectrumChart.update("none");
 }
 
 function updatePlaybackUI() {
@@ -2844,6 +3126,9 @@ function updatePlaybackUI() {
     { label: "Expected Runup", value: current.expectedRunup, color: COLORS.green, dash: "12 8", mode: "runup" },
     { label: "Conservative Runup", value: current.conservativeRunup, color: COLORS.yellow, dash: "12 8", mode: "runup" },
     { label: "Upper Bound Runup", value: current.upperBoundRunup, color: COLORS.coral, dash: "12 8", mode: "runup" },
+    ...(Number.isFinite(current.spectralWeightedRunup)
+      ? [{ label: "Spectral-Weighted Runup", value: current.spectralWeightedRunup, color: COLORS.spectral, dash: "3 5", mode: "runup" }]
+      : []),
   ];
   dom.runupProfile.innerHTML = renderProfileSvg({
     profile,
@@ -2855,6 +3140,7 @@ function updatePlaybackUI() {
       state.modelParams.duneCrestElevation + 1.2,
       current.upperBoundRunup + 1.2,
       current.maxCrest + 1.2,
+      (Number.isFinite(current.spectralWeightedRunup) ? current.spectralWeightedRunup + 1.2 : Number.NEGATIVE_INFINITY),
       (hasPierDeck ? current.maxWaveSplashUp + 0.8 : Number.NEGATIVE_INFINITY),
       pierDeckMaxElevation + 0.8
     ),
@@ -2881,6 +3167,7 @@ function updatePlaybackUI() {
     state.windChart.options.plugins.currentTimeLine.value = current.timeMs;
     state.windChart.update("none");
   }
+  updateSpectrumChart(state.selectedForecast, state.currentIndex);
 }
 
 function getContainerAspectRatio(element, fallbackRatio = DEFAULT_FIGURE_RATIO) {
@@ -2979,7 +3266,7 @@ function syncVisibleTransects() {
       {
         renderer: state.canvasRenderer,
         interactive: false,
-        ...getTransectDisplayStyle({ isSelected, isHovered: false }),
+        ...getTransectDisplayStyle({ label: transect.label, isSelected, isHovered: false }),
       }
     );
     const hitLayer = L.polyline(
@@ -3002,7 +3289,9 @@ function syncVisibleTransects() {
     hitLayer.on("click", () => {
       selectTransect(transect, { flyTo: false }).catch((error) => console.error(error));
     });
-    hitLayer.bindTooltip(transect.label, {
+    const availability = transectAvailabilitySource(transect.label, state.knownTransectProfiles, state.demProfileCatalog);
+    const availabilityText = { default: "Default profile", dem: "Experimental DEM profile available", surveyed: "Surveyed profile available" }[availability];
+    hitLayer.bindTooltip(`${transect.label} | ${availabilityText}`, {
       sticky: true,
       direction: "top",
       className: "transect-tooltip",
@@ -3076,17 +3365,19 @@ function findNearestStation(transect, stations) {
   return bestStation;
 }
 
-function getTransectDisplayStyle({ isSelected, isHovered }) {
+function getTransectDisplayStyle({ label, isSelected, isHovered }) {
+  const source = transectAvailabilitySource(label, state.knownTransectProfiles, state.demProfileCatalog);
+  const color = TRANSECT_SOURCE_COLORS[source];
   if (isSelected) {
     return {
-      color: COLORS.blue,
+      color,
       weight: isHovered ? 5.4 : 4.5,
       opacity: 0.98,
     };
   }
 
   return {
-    color: isHovered ? "#71ddcf" : COLORS.aqua,
+    color,
     weight: isHovered ? 3.4 : 2.1,
     opacity: isHovered ? 0.92 : 0.68,
   };
@@ -3128,6 +3419,7 @@ function refreshVisibleTransectStyle(label) {
   const isSelected = label === state.selectedTransect?.label;
   const isHovered = label === state.hoveredTransectLabel;
   entry.displayLayer.setStyle(getTransectDisplayStyle({
+    label,
     isSelected,
     isHovered,
   }));
@@ -3214,7 +3506,7 @@ function normalizeTideStation(rawStation) {
   return { id, name, lat, lng };
 }
 
-function classifyOvertopping({ expectedRunup, conservativeRunup, upperBoundRunup, duneCrestElevation }) {
+function classifyOvertopping({ expectedRunup, conservativeRunup, upperBoundRunup, spectralWeightedRunup, duneCrestElevation, beachElevationBase, bermWidth }) {
   if (expectedRunup > duneCrestElevation) {
     return {
       rank: 3,
@@ -3235,7 +3527,8 @@ function classifyOvertopping({ expectedRunup, conservativeRunup, upperBoundRunup
       color: "#8a5d0a",
     };
   }
-  if (upperBoundRunup > duneCrestElevation) {
+  if (upperBoundRunup > duneCrestElevation ||
+      (Number.isFinite(spectralWeightedRunup) && spectralWeightedRunup > duneCrestElevation)) {
     return {
       rank: 1,
       label: "Minor overtopping possible",
@@ -3243,6 +3536,21 @@ function classifyOvertopping({ expectedRunup, conservativeRunup, upperBoundRunup
       figureLabel: "Minor Overtopping Possible",
       background: "rgba(34, 183, 167, 0.18)",
       color: "#0d6b61",
+    };
+  }
+  // SI geometry: 10 international feet is exactly 3.048 m. This is a toe
+  // exceedance warning only; rank stays zero so it is not crest overtopping.
+  if (Number.isFinite(bermWidth) && bermWidth > 3.048 && Number.isFinite(beachElevationBase) &&
+      [expectedRunup, conservativeRunup, upperBoundRunup, spectralWeightedRunup]
+        .some(elevation => Number.isFinite(elevation) && elevation > beachElevationBase)) {
+    return {
+      rank: 0,
+      lowerBeachOverwash: true,
+      label: "Overtopping not expected; Possible Lower Beach Overwash",
+      forecastLabel: "Possible Lower Beach Overwash",
+      figureLabel: "Possible Lower Beach Overwash",
+      background: "rgba(243, 194, 107, 0.22)",
+      color: "#8a5d0a",
     };
   }
   return {
@@ -3261,7 +3569,8 @@ function getWorstOvertoppingCategory(results) {
   }
 
   return results.reduce((worstCategory, result) => {
-    if (!worstCategory || result.category.rank > worstCategory.rank) {
+    if (!worstCategory || result.category.rank > worstCategory.rank ||
+        (result.category.rank === worstCategory.rank && result.category.lowerBeachOverwash && !worstCategory.lowerBeachOverwash)) {
       return result.category;
     }
     return worstCategory;

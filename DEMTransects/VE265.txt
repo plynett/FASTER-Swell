@@ -1,0 +1,7 @@
+{
+  "averageBeachSlope": 0.11819600018285903,
+  "beachElevationBase": 2.7477928129852778,
+  "bermWidth": 0.0,
+  "duneCrestElevation": 3.351935920579201,
+  "toeToCrestDistance": 6.544098317323346
+}

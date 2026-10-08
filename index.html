@@ -37,6 +37,12 @@
         </div>
         <div class="map-frame">
           <div id="map"></div>
+          <div class="transect-legend" aria-label="Transect profile availability">
+            <span><i class="transect-key default"></i>Default</span>
+            <span><i class="transect-key dem"></i>DEM available</span>
+            <span><i class="transect-key surveyed"></i>Surveyed available</span>
+            <small>Thicker line = selected. Colors show availability.</small>
+          </div>
           <div class="map-overlay-card" id="mapOverlayCard">
             <h3>Zoom in to reveal local transects</h3>
             <p>Transects appear once the map reaches the local analysis scale. Click any line to bind the other panels to that site.</p>
@@ -112,8 +118,11 @@
           </div>
 
           <div class="toolbar-row">
-            <div class="button-cluster">
-              <button id="resetDefaultsButton" class="ghost-button" type="button">Reset Defaults</button>
+            <div class="button-cluster profile-source-controls" aria-label="Transect profile sources">
+              <button id="resetDefaultsButton" class="ghost-button" type="button" aria-pressed="false">Set to Default</button>
+              <button id="demProfileButton" class="ghost-button hidden" type="button" aria-pressed="false">Set to DEM-Based Transect</button>
+              <button id="surveyedProfileButton" class="ghost-button hidden" type="button" aria-pressed="false">Set to Surveyed Transect</button>
+              <a id="demComparisonLink" class="profile-comparison-link hidden" target="_blank" rel="noopener">View DEM comparison</a>
             </div>
           </div>
         </div>
@@ -123,7 +132,7 @@
         <div class="panel-header">
           <div>
             <p class="panel-eyebrow">Forecast Playback</p>
-            <h2>Wave/Tide Panels</h2>
+            <h2>Wave/Tide/Wind Panels</h2>
           </div>
           <div class="panel-actions">
             <span class="status-pill subtle" id="runStatusPill">Auto-loading</span>
@@ -164,6 +173,15 @@
                 <canvas id="windChartCanvas"></canvas>
               </div>
             </div>
+            <div class="chart-panel spectrum-panel">
+              <div class="chart-title-row">
+                <h3 id="spectrumChartTitle">Discrete Amplitude Spectrum</h3>
+                <span id="spectrumTimeLabel">--</span>
+              </div>
+              <div class="chart-canvas-frame">
+                <canvas id="spectrumChartCanvas" aria-label="Wave component amplitudes in one-second period bins" role="img"></canvas>
+              </div>
+            </div>
           </div>
 
           <div class="timeline-controls" id="timelineControls">
@@ -196,7 +214,7 @@
         </div>
 
         <div class="runup-content hidden" id="runupContent">
-          <p class="runup-shell-copy">Still water, maximum crest, expected, conservative, and upper-bound runup are projected across the edited transect.</p>
+          <p class="runup-shell-copy">Still water, maximum crest, and bulk and experimental spectral-weighted runup are projected across the edited transect.</p>
           <div class="runup-panel">
             <div class="runup-profile" id="runupProfile"></div>
           </div>
@@ -204,6 +222,20 @@
       </section>
     </main>
   </div>
+
+  <dialog id="demComparisonDialog" class="dem-comparison-dialog" aria-labelledby="demComparisonTitle">
+    <div class="dem-comparison-header">
+      <h2 id="demComparisonTitle">DEM profile comparison</h2>
+      <form method="dialog"><button class="ghost-button" autofocus>Close</button></form>
+    </div>
+    <div class="dem-inspection-controls">
+      <label for="demComparisonSource">Survey / comparison</label>
+      <select id="demComparisonSource"></select>
+      <a id="demComparisonReview" class="hidden" target="_blank" rel="noopener">Full DEM review and diagnostics</a>
+    </div>
+    <p id="demComparisonNote" class="dem-inspection-note"></p>
+    <img id="demComparisonImage" alt="Measured DEM terrain">
+  </dialog>
 
   <script
     src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
