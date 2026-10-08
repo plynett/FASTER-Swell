@@ -41,6 +41,7 @@
             <span><i class="transect-key default"></i>Default</span>
             <span><i class="transect-key dem"></i>DEM available</span>
             <span><i class="transect-key surveyed"></i>Surveyed available</span>
+            <a class="bay-map-link" href="?bay=huntington-harbor" id="huntingtonBayLink"><i class="bay-key"></i>Huntington Harbor Bay Point</a>
             <small>Thicker line = selected. Colors show availability.</small>
           </div>
           <div class="map-overlay-card" id="mapOverlayCard">
@@ -70,7 +71,7 @@
         <div class="profile-card">
           <div class="profile-card-header">
             <div>
-              <h3>Editable Transect Profile</h3>
+              <h3 id="geometryTitle">Editable Transect Profile</h3>
             </div>
             <div class="profile-toggle-cluster">
               <div class="segmented-control" id="profileModeControl">
@@ -91,6 +92,10 @@
           <div class="profile-preview" id="geometryPreview"></div>
 
           <div class="form-grid">
+            <label class="field hidden" id="bayGroundField">
+              <span data-label-metric="Ground/Structure Elevation (m, NAVD88)" data-label-english="Ground/Structure Elevation (ft, NAVD88)">Ground/Structure Elevation (ft, NAVD88)</span>
+              <input id="bayGroundElevationInput" type="number" step="0.1" required>
+            </label>
             <label class="field">
               <span data-label-metric="Average Beach-Face Slope over the Swash Zone" data-label-english="Average Beach-Face Slope over the Swash Zone">Average Beach-Face Slope over the Swash Zone</span>
               <input id="averageBeachSlopeInput" type="number" step="0.001" min="0.001" title="Auto-estimated as twice the average MOP slope when available; edit if surveyed slope is available.">
@@ -115,7 +120,13 @@
               <span data-label-metric="Sea-Level Anomaly (m)" data-label-english="Sea-Level Anomaly (ft)">Sea-Level Anomaly (ft)</span>
               <input id="tideSurgeLevelInput" type="number" step="0.05">
             </label>
+            <label class="field hidden" id="bayUncertaintyField">
+              <span data-label-metric="Water Level Fluctuation / Uncertainty (m)" data-label-english="Water Level Fluctuation / Uncertainty (ft)">Water Level Fluctuation / Uncertainty (ft)</span>
+              <input id="bayUncertaintyInput" type="number" min="0" step="any" required>
+            </label>
           </div>
+
+          <p class="bay-source-note hidden" id="baySourceNote" role="status"></p>
 
           <div class="toolbar-row">
             <div class="button-cluster profile-source-controls" aria-label="Transect profile sources">
@@ -200,8 +211,8 @@
       <section class="panel runup-shell">
         <div class="panel-header">
           <div>
-            <p class="panel-eyebrow">Runup Output</p>
-            <h2>Projected Water Levels Across the Transect</h2>
+            <p class="panel-eyebrow">Flooding Output</p>
+            <h2 id="floodingTitle">Projected Water Levels Across the Transect</h2>
           </div>
           <div class="panel-actions">
             <span class="category-pill" id="categoryPill">--</span>

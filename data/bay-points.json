@@ -1,0 +1,16 @@
+[
+  {
+    "id": "huntington-harbor",
+    "label": "HH001",
+    "type": "bay",
+    "name": "Huntington Harbor",
+    "predictionLat": 33.721485,
+    "predictionLon": -118.064714,
+    "entranceTransect": "OC641",
+    "groundElevation": 1.9812,
+    "uncertainty": 0,
+    "worstCaseFetchMeters": 1500,
+    "tideStation": { "id": "9410660", "name": "Los Angeles (Outer Harbor)" },
+    "sourceNote": "Outside-harbor NOAA proxy. No calibrated harbor tidal lag or attenuation is applied. Los Patos lacks a verified NAVD88 time series; nearer Long Beach Fire Boat Pier does not currently provide NAVD88 via NOAA."
+  }
+]

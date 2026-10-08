@@ -1,5 +1,7 @@
 import { parseDap2NumericArray, parseDap2Matrix, buildForecastAmplitudeSpectra } from "./scripts/period-spectrum.mjs";
 import { computeSpectralWeightedRunup } from "./scripts/spectral-runup.mjs";
+import { BAY_STEP_MS, BAY_WINDOW_MS, DEFAULT_BAY_UNCERTAINTY_METERS, computeBayResults, summarizeBayResults, buildBayFloodWindows, nearestEntranceIndex, getBayPlotLimits, buildBayWallProfile } from "./scripts/bay-flood.mjs";
+import { estimateFetchLimitedChopMeters } from "./scripts/fetch-chop.mjs";
 import { buildOvertoppingWindows, overtoppingBackgroundPlugin } from "./scripts/tide-overtopping.mjs";
 import { createDemProfileLoader, createDemImageLoader, createDemCatalogLoader, preferredProfileSource, transectAvailabilitySource, TRANSECT_SOURCE_COLORS } from "./scripts/dem-profiles.mjs";
 
@@ -90,6 +92,11 @@ const state = {
   geometryRevision: 0,
   hindcastWindow: null,
   selectedTransect: null,
+  bayPoints: [],
+  bayMarkers: new Map(),
+  bayPlotLimits: null,
+  bayAnomaly: null,
+  bayLoadMessages: {},
   selectedDatasetMeta: null,
   selectedForecast: null,
   selectedTideStation: null,
@@ -178,6 +185,9 @@ const dom = {
   bermWidthInput: document.getElementById("bermWidthInput"),
   duneCrestElevationInput: document.getElementById("duneCrestElevationInput"),
   toeToCrestDistanceInput: document.getElementById("toeToCrestDistanceInput"),
+  bayGroundElevationInput: document.getElementById("bayGroundElevationInput"),
+  bayUncertaintyInput: document.getElementById("bayUncertaintyInput"),
+  baySourceNote: document.getElementById("baySourceNote"),
 };
 
 const profileModeButtons = [...dom.profileModeControl.querySelectorAll("[data-mode]")];
@@ -276,11 +286,12 @@ init().catch((error) => {
 async function init() {
   setAppStatus("Loading transects, manifests, and NOAA station metadata...");
 
-  const [manifest, transectPayload, knownTransectsCsv, demCatalog] = await Promise.all([
+  const [manifest, transectPayload, knownTransectsCsv, demCatalog, bayPoints] = await Promise.all([
     fetchJSON("./data/forecast-manifest.json"),
     fetchJSON("./data/transects.json"),
     fetchOptionalText(KNOWN_TRANSECTS_CSV_URL),
     loadDemCatalog(),
+    fetchJSON("./data/bay-points.json"),
   ]);
 
   state.manifest = manifest;
@@ -288,6 +299,7 @@ async function init() {
   state.genericDefaults = manifest.genericDefaults || transectPayload.genericDefaults;
   state.knownTransectProfiles = parseKnownTransectProfiles(knownTransectsCsv);
   state.demProfileCatalog = demCatalog;
+  state.bayPoints = bayPoints;
   state.hindcastWindow = getHindcastWindowFromLocation();
   state.tideStationsPromise = fetchCaliforniaTideStations();
 
@@ -303,7 +315,10 @@ async function init() {
     });
   }
 
-  await selectTransect(requestedTransect || demoTransect, { flyTo: Boolean(requestedTransect) });
+  const requestedBayId = new URL(window.location.href).searchParams.get("bay");
+  const requestedBay = state.bayPoints.find(point => point.id === requestedBayId);
+  if (requestedBay) await selectBayPoint(requestedBay);
+  else await selectTransect(requestedTransect || demoTransect, { flyTo: Boolean(requestedTransect) });
   scheduleTopRowHeightCapture();
 
   setAppStatus(
@@ -384,6 +399,15 @@ function initMap() {
   ).addTo(state.map);
 
   state.transectLayerGroup = L.layerGroup().addTo(state.map);
+  for (const point of state.bayPoints) {
+    const marker = L.marker([point.predictionLat, point.predictionLon], {
+      title: `${point.name} Bay Point`, alt: `${point.name} Bay Point`,
+      icon: L.divIcon({ className: "bay-point-marker", html: '<span class="bay-key" style="width:20px;height:20px"></span>', iconSize: [24, 24], iconAnchor: [12, 12] }),
+    });
+    marker.bindTooltip(`${point.name} | Bay Point`);
+    marker.on("click", () => selectBayPoint(point).catch(console.error));
+    state.bayMarkers.set(point.id, marker);
+  }
   state.map.on("zoomend moveend", syncVisibleTransects);
   window.addEventListener("resize", () => {
     state.map.invalidateSize(false);
@@ -402,6 +426,28 @@ function initMap() {
 }
 
 function bindControls() {
+  document.getElementById("huntingtonBayLink").addEventListener("click", event => {
+    event.preventDefault();
+    selectBayPoint(state.bayPoints.find(point => point.id === "huntington-harbor")).catch(console.error);
+  });
+  dom.bayGroundElevationInput.addEventListener("input", () => {
+    if (!isBayPoint()) return;
+    const input = dom.bayGroundElevationInput;
+    if (!input.value.trim() || !Number.isFinite(Number(input.value))) return;
+    state.modelParams.groundElevation = Number(input.value) * (state.displayUnits === "english" ? 0.3048 : 1);
+    updateGeometryPreview();
+    refreshBayResults();
+  });
+  dom.bayUncertaintyInput.addEventListener("input", () => {
+    if (!isBayPoint()) return;
+    const input = dom.bayUncertaintyInput;
+    const value = input.valueAsNumber;
+    const valid = Number.isFinite(value) && value >= 0;
+    input.setCustomValidity(valid ? "" : "Enter a nonnegative water-level uncertainty.");
+    if (!valid) return;
+    state.modelParams.uncertainty = value * (state.displayUnits === "english" ? 0.3048 : 1);
+    refreshBayResults();
+  });
   for (const id of numericInputIds) {
     dom[id].addEventListener("input", handleParameterInput);
   }
@@ -496,6 +542,16 @@ function updateUnitAwareLabels() {
 }
 
 function refreshDisplayPresentation() {
+  if (isBayPoint()) {
+    updateUnitAwareLabels();
+    presentBayInputs();
+    updateGeometryPreview();
+    if (state.selectedTideSeries) {
+      renderCharts(state.selectedForecast || emptyEntranceForecast(), state.selectedTideSeries, state.selectedWindSeries);
+      updatePlaybackUI();
+    }
+    return;
+  }
   updateUnitAwareLabels();
   if (state.modelParams) {
     applyModelParams(state.modelParams);
@@ -514,6 +570,238 @@ function refreshDisplayPresentation() {
   }
 }
 
+function isBayPoint() {
+  return state.selectedTransect?.type === "bay";
+}
+
+function setLocationPresentation(bay) {
+  dom.transectPanel.classList.toggle("bay-mode", bay);
+  document.getElementById("bayGroundField").classList.toggle("hidden", !bay);
+  document.getElementById("bayUncertaintyField").classList.toggle("hidden", !bay);
+  for (const id of numericInputIds.filter(id => id !== "tideSurgeLevelInput")) dom[id].closest(".field").classList.toggle("hidden", bay);
+  dom.profileModeControl.classList.toggle("hidden", bay);
+  dom.baySourceNote.classList.toggle("hidden", !bay);
+  dom.tideSurgeLevelInput.readOnly = bay;
+  dom.tideSurgeLevelInput.placeholder = bay ? "Unavailable" : "";
+  document.getElementById("geometryTitle").textContent = bay ? "Ground / Structure Elevation" : "Editable Transect Profile";
+  document.getElementById("floodingTitle").textContent = bay ? "Projected Harbor Water Levels" : "Projected Water Levels Across the Transect";
+  document.querySelector(".runup-shell-copy").textContent = bay
+    ? "Experimental point estimate: tide + anomaly, with water-level uncertainty and fetch-limited wind chop. Entrance waves are not used. Does not model harbor circulation, rainfall, drainage, or boat wakes."
+    : "Still water, maximum crest, and bulk and experimental spectral-weighted runup are projected across the edited transect.";
+  for (const [id, marker] of state.bayMarkers) marker.setOpacity(bay && state.selectedTransect.id === id ? 1 : 0.75);
+}
+
+function emptyEntranceForecast() {
+  return { waveTimeMs: [], waveHs: [], waveTp: [], amplitudeSpectra: null };
+}
+
+function bayWallFigure(container, row = null) {
+  const limits = row ? state.bayPlotLimits : getBayPlotLimits([], state.modelParams.groundElevation);
+  const waterLevel = row ? row.waterLevel : 0;
+  const overlays = [
+    { label: row ? "Water Level + Anomaly" : "Still Water Reference", value: waterLevel, color: COLORS.waterEdge, dash: "" },
+    ...(row ? [
+      { label: "Water + Anomaly + Uncertainty", value: row.uncertaintyElevation, color: COLORS.yellow, dash: "8 5" },
+      { label: "Water + Anomaly + Uncertainty + Chop", value: row.chopElevation, color: COLORS.red, dash: "8 5" },
+    ] : []),
+  ].filter(overlay => Number.isFinite(overlay.value)).map(overlay => ({ ...overlay, mode: "crest", extendLeftToAxis: true }));
+  return renderProfileSvg({
+    profile: buildBayWallProfile(state.modelParams.groundElevation, limits.yMin),
+    ...limits, waterLevel, overlays, showLegend: Boolean(row),
+    figureAspectRatio: getContainerAspectRatio(container, DEFAULT_FIGURE_RATIO), minFigureHeight: 160,
+    xAxisLabel: "Harbor / Ground (schematic)",
+    title: row ? `Flooding profile at ${formatShortDateTime(row.timeMs)} ${getTimeModeLabel()} - ${row.category.label}` : "",
+  });
+}
+
+function presentBayInputs() {
+  dom.bayGroundElevationInput.value = (state.modelParams.groundElevation * (state.displayUnits === "english" ? 1 / 0.3048 : 1)).toFixed(2);
+  dom.bayUncertaintyInput.value = formatDisplayInputValue(state.modelParams.uncertainty, state.displayUnits === "english" ? 2 : 4);
+  dom.bayUncertaintyInput.setCustomValidity("");
+  dom.tideSurgeLevelInput.value = Number.isFinite(state.bayAnomaly?.anomaly) ? formatDisplayInputValue(state.bayAnomaly.anomaly, 2) : "";
+  dom.tideSurgeLevelInput.title = state.bayAnomaly
+    ? `${state.hindcastWindow ? "Historical-window" : "Latest 3-day"} mean observed-minus-predicted residual, ending ${formatShortDateTime(state.bayAnomaly.endMs)} ${getTimeModeLabel()}; held constant through the selected window.`
+    : "Recent measured anomaly is unavailable. It is not assumed to be zero.";
+}
+
+function updateBaySourceNote() {
+  const point = state.selectedTransect;
+  const anomalyNote = state.bayAnomaly ? `Anomaly: ${state.hindcastWindow ? "historical-window" : "latest 3-day"} mean, ending ${formatShortDateTime(state.bayAnomaly.endMs)} ${getTimeModeLabel()}.` : "Anomaly unavailable; flooding cannot be assessed.";
+  const chopGap = state.results?.some(row => row.chopHeight === null) ? "Chop unavailable for part of the window; no zero-fill or extrapolation is used." : "";
+  const fetchNote = `Chop: fetch-limited JONSWAP, worst-case fetch ${formatDisplayLength(point.worstCaseFetchMeters, 0)}, periods below 4 s. Assumes sustained wind; no depth or sheltering correction.`;
+  dom.baySourceNote.textContent = `NOAA ${point.tideStation.id}, ${point.tideStation.name}. ${point.sourceNote} ${anomalyNote} ${fetchNote} ${chopGap} ${Object.values(state.bayLoadMessages).join(" ")}`;
+}
+
+async function withBayTimeout(promise) {
+  let timer;
+  try {
+    return await Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("Request timed out")), 35000); })]);
+  } finally { clearTimeout(timer); }
+}
+
+async function selectBayPoint(point) {
+  if (!point) return;
+  const requestId = ++state.selectionRequestId;
+  stopPlayback();
+  state.selectedTransect = point;
+  state.results = null;
+  state.selectedForecast = null;
+  state.selectedDatasetMeta = null;
+  state.selectedDemProfile = null;
+  state.selectedDemImages = [];
+  state.selectedPierTransect = null;
+  state.selectedTideSeries = null;
+  state.selectedWindSeries = null;
+  state.selectedTideStation = point.tideStation;
+  state.bayAnomaly = null;
+  state.bayLoadMessages = {};
+  state.currentIndex = 0;
+  state.modelParams = { groundElevation: point.groundElevation, uncertainty: point.uncertainty ?? DEFAULT_BAY_UNCERTAINTY_METERS };
+  const hindcastWindow = state.hindcastWindow;
+  const startMs = hindcastWindow?.startMs ?? Math.floor(Date.now() / BAY_STEP_MS) * BAY_STEP_MS;
+  state.currentTideWindow = { startMs, endMs: hindcastWindow?.endMs ?? startMs + BAY_WINDOW_MS };
+  const mode = hindcastWindow ? "hindcast" : "forecast";
+  const stale = () => isSelectionRequestStale(requestId, point.label);
+  destroyForecastCharts();
+  dom.demComparisonDialog.close();
+  dom.demComparisonImage.removeAttribute("src");
+  for (const element of [dom.demProfileButton, dom.surveyedProfileButton, dom.demComparisonLink]) element.classList.add("hidden");
+  setLocationPresentation(true);
+  presentBayInputs();
+  dom.selectedTransectLabel.textContent = point.label;
+  dom.selectionTitle.textContent = `${point.name} - Bay Point`;
+  dom.dataAvailabilityPill.textContent = `Loading bay ${mode}`;
+  dom.runStatusPill.textContent = `Loading bay ${mode}...`;
+  dom.categoryPill.textContent = "--";
+  dom.categoryPill.style.background = "rgba(17,49,76,0.12)";
+  dom.categoryPill.style.color = COLORS.navy;
+  dom.forecastEmptyState.classList.remove("hidden");
+  dom.forecastContent.classList.add("hidden");
+  dom.runupEmptyState.classList.remove("hidden");
+  dom.runupContent.classList.add("hidden");
+  dom.forecastEmptyState.querySelector("h3").textContent = "Loading harbor tides, anomaly, and local wind...";
+  dom.forecastEmptyState.querySelector("p").textContent = "Entrance waves are requested separately and are not required for the flooding assessment.";
+  dom.runupEmptyState.querySelector("h3").textContent = "Preparing bay flooding assessment...";
+  dom.runupEmptyState.querySelector("p").textContent = "Comparing water level and local chop with the ground/structure elevation.";
+  dom.metricGrid.innerHTML = "";
+  dom.runupProfile.innerHTML = "";
+  dom.baySourceNote.textContent = `Loading NOAA ${point.tideStation.id} NAVD88 tides and ${hindcastWindow ? "historical" : "recent"} observations; ${point.entranceTransect} waves are context only.`;
+  const url = new URL(window.location.href);
+  url.searchParams.delete("transect");
+  url.searchParams.set("bay", point.id);
+  url.hash = "";
+  window.history.replaceState({ bay: point.id }, "", url);
+  updateGeometryPreview();
+  applyTopRowHeightLock();
+  syncVisibleTransects();
+  state.map.flyTo([point.predictionLat, point.predictionLon], Math.max(13, state.map.getZoom()), { duration: 0.7 });
+
+  // Entrance waves are context only: do not wait for them before displaying bay results.
+  const entranceRequest = hindcastWindow
+    ? fetchHistoricalMopDataset(point.entranceTransect, hindcastWindow)
+    : fetchThreddsAsciiForecastDataset(point.entranceTransect);
+  void withBayTimeout(entranceRequest).then(dataset => {
+    if (stale()) return;
+    state.selectedForecast = dataset;
+    if (state.selectedTideSeries) {
+      renderCharts(dataset, state.selectedTideSeries, state.selectedWindSeries);
+      updateBayPlaybackUI();
+    }
+  }).catch(error => {
+    if (stale()) return;
+    console.warn("[FASTER Bay] Entrance waves unavailable", error);
+    state.bayLoadMessages.entrance = "Harbor entrance waves unavailable; the bay calculation does not use MOP waves.";
+    updateBaySourceNote();
+  });
+
+  const endMs = state.currentTideWindow.endMs;
+  const [tides, anomaly, wind] = await Promise.allSettled([
+    withBayTimeout(loadNoaaWaterLevelSeries({ stationId: point.tideStation.id, product: "predictions", interval: "6", startMs, endMs })),
+    withBayTimeout(loadSeaLevelAnomalyEstimate(point.tideStation.id, hindcastWindow ? { startMs, endMs } : null)),
+    // Include a real wind interval for the inclusive final tide sample.
+    withBayTimeout(hindcastWindow
+      ? loadHistoricalWindSeries(point, startMs, endMs + BAY_STEP_MS)
+      : loadWindForecastSeries(point, startMs, endMs + BAY_STEP_MS)),
+  ]);
+  if (stale()) return;
+  state.bayAnomaly = anomaly.status === "fulfilled" ? anomaly.value : null;
+  state.selectedWindSeries = wind.status === "fulfilled" ? wind.value : null;
+  if (wind.status === "rejected") state.bayLoadMessages.wind = `${hindcastWindow ? "Historical" : "NWS"} local wind unavailable.`;
+  presentBayInputs();
+  if (tides.status === "rejected" || !tides.value.length) {
+    state.bayLoadMessages.tide = "NOAA tide predictions unavailable. Reselect this Bay Point to retry.";
+    dom.forecastEmptyState.querySelector("h3").textContent = "Bay tide predictions unavailable";
+    dom.forecastEmptyState.querySelector("p").textContent = state.bayLoadMessages.tide;
+    dom.runupEmptyState.querySelector("h3").textContent = "Flooding assessment unavailable";
+    dom.runStatusPill.textContent = "Tides unavailable";
+    dom.dataAvailabilityPill.textContent = "Tides unavailable";
+    updateBaySourceNote();
+    return;
+  }
+  state.selectedTideSeries = { stationId: point.tideStation.id, timeMs: tides.value.map(row => row.timeMs), level: tides.value.map(row => row.level) };
+  dom.forecastEmptyState.classList.add("hidden");
+  dom.forecastContent.classList.remove("hidden");
+  dom.timelineControls.classList.remove("hidden");
+  dom.metricGrid.classList.remove("hidden");
+  dom.runupEmptyState.classList.add("hidden");
+  dom.runupContent.classList.remove("hidden");
+  refreshBayResults();
+  renderCharts(state.selectedForecast || emptyEntranceForecast(), state.selectedTideSeries, state.selectedWindSeries);
+  updateBayPlaybackUI();
+}
+
+function refreshBayResults() {
+  if (!isBayPoint() || !state.selectedTideSeries) return;
+  state.results = computeBayResults({ tideSeries: state.selectedTideSeries, windSeries: state.selectedWindSeries,
+    anomaly: state.bayAnomaly?.anomaly, groundElevation: state.modelParams.groundElevation,
+    uncertainty: state.modelParams.uncertainty, ...state.currentTideWindow });
+  state.bayPlotLimits = getBayPlotLimits(state.results, state.modelParams.groundElevation);
+  if (!state.results.length) return;
+  const start = getPlaybackStartIndex(state.results);
+  dom.timeSlider.min = String(start);
+  dom.timeSlider.max = String(state.results.length - 1);
+  state.currentIndex = Math.max(start, Math.min(state.currentIndex, state.results.length - 1));
+  if (state.tideChart) state.tideChart.options.plugins.overtoppingBackground.windows = buildBayFloodWindows(state.results);
+  dom.runStatusPill.textContent = state.bayAnomaly ? `Bay ${state.hindcastWindow ? "hindcast" : "forecast"} ready` : "Anomaly unavailable";
+  dom.dataAvailabilityPill.textContent = `Experimental bay ${state.hindcastWindow ? "hindcast" : "forecast"}`;
+  updateBayPlaybackUI();
+}
+
+function updateBayPlaybackUI() {
+  if (!state.results?.length) return;
+  const start = getPlaybackStartIndex(state.results);
+  state.currentIndex = Math.max(start, Math.min(state.currentIndex, state.results.length - 1));
+  const row = state.results[state.currentIndex];
+  const summary = summarizeBayResults(state.results.slice(start));
+  const format = value => Number.isFinite(value) ? formatDisplayLength(value, 2) : "Unavailable";
+  dom.timeSlider.min = String(start);
+  dom.timeSlider.value = String(state.currentIndex);
+  dom.sliderTimeLabel.textContent = formatShortDateTime(row.timeMs);
+  dom.sliderIndexLabel.textContent = `${state.currentIndex - start + 1} / ${state.results.length - start}`;
+  dom.currentTimeLabel.textContent = `${formatShortDateTime(row.timeMs)} ${getTimeModeLabel()}`;
+  dom.metricGrid.innerHTML = [["Predicted Tide", row.predictedTide], ["Sea-Level Anomaly", state.bayAnomaly?.anomaly],
+    ["Water + Anomaly", row.waterLevel], ["Water-Level Uncertainty", row.uncertainty],
+    ["Water + Anomaly + Uncertainty", row.uncertaintyElevation], ["Fetch-Limited Chop", row.chopHeight],
+    ["Water + Anomaly + Uncertainty + Chop", row.chopElevation],
+    ["Ground / Structure", state.modelParams.groundElevation]].map(([label, value]) => makeMetricCard(label, format(value))).join("");
+  dom.runupProfile.innerHTML = bayWallFigure(dom.runupProfile, row);
+  const incomplete = summary.hasGaps || state.results[0].timeMs > state.currentTideWindow.startMs + BAY_STEP_MS
+    || state.results.at(-1).timeMs < state.currentTideWindow.endMs - BAY_STEP_MS;
+  dom.categoryPill.textContent = summary.category.rank === null ? summary.category.label
+    : incomplete ? `${summary.category.label} in available ${state.hindcastWindow ? "hindcast" : "forecast"} data (some times unassessed)`
+      : formatForecastOvertoppingLabel(summary.category, state.results.slice(start));
+  dom.categoryPill.style.background = summary.category.background;
+  dom.categoryPill.style.color = summary.category.color;
+  dom.playPauseButton.textContent = state.isPlaying ? "Pause" : "Play";
+  for (const chart of [state.waveChart, state.tideChart, state.windChart]) {
+    if (!chart) continue;
+    chart.options.plugins.currentTimeLine.value = row.timeMs;
+    chart.update("none");
+  }
+  updateSpectrumChart(state.selectedForecast, state.currentIndex);
+  updateBaySourceNote();
+}
+
 async function selectTransect(transect, options = {}) {
   if (!transect) {
     return;
@@ -523,6 +811,7 @@ async function selectTransect(transect, options = {}) {
   state.selectionRequestId = selectionRequestId;
   stopPlayback();
   state.selectedTransect = transect;
+  setLocationPresentation(false);
   state.selectedDemProfile = null;
   state.selectedDemImages = [];
   state.geometryRevision = 0;
@@ -806,6 +1095,7 @@ function syncSelectedTransectUrl(transectLabel) {
 
   const url = new URL(window.location.href);
   url.searchParams.set(TRANSECT_QUERY_PARAM, transectLabel);
+  url.searchParams.delete("bay");
   url.hash = "";
   window.history.replaceState({ transect: transectLabel }, "", url.toString());
 }
@@ -996,6 +1286,7 @@ async function runModel(options = {}) {
 }
 
 function handleParameterInput() {
+  if (isBayPoint()) return;
   state.geometryRevision += 1;
   state.profileSource = "custom";
   syncProfileSourceControls();
@@ -1155,6 +1446,14 @@ function getDefaultsForTransect(transectOrLabel) {
 
 function applyProfileSource(source, { automatic = false } = {}) {
   if (!state.selectedTransect) return;
+  if (isBayPoint()) {
+    state.modelParams.groundElevation = state.selectedTransect.groundElevation;
+    state.modelParams.uncertainty = state.selectedTransect.uncertainty ?? DEFAULT_BAY_UNCERTAINTY_METERS;
+    presentBayInputs();
+    updateGeometryPreview();
+    refreshBayResults();
+    return;
+  }
   const profile = source === "dem" ? state.selectedDemProfile?.params
     : source === "surveyed" ? getKnownTransectProfile(state.selectedTransect) : null;
   if (source !== "default" && !profile) return;
@@ -1245,6 +1544,10 @@ function syncAverageBeachSlopeInputTitle(transect) {
 }
 
 function updateGeometryPreview() {
+  if (isBayPoint()) {
+    dom.geometryPreview.innerHTML = bayWallFigure(dom.geometryPreview);
+    return;
+  }
   if (!state.modelParams) {
     return;
   }
@@ -1324,6 +1627,7 @@ function renderProfileSvg({
   footerLines = [],
   preserveAspectRatio = "xMidYMid meet",
   showLegend = false,
+  xAxisLabel = getDistanceAxisLabel(),
 }) {
   const width = 940;
   const height = Math.max(minFigureHeight, Math.round(width / Math.max(figureAspectRatio, 1)));
@@ -1422,7 +1726,7 @@ function renderProfileSvg({
     : "";
 
   return `
-    <svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="${preserveAspectRatio}" role="img" aria-label="${escapeHtml(title || "Profile preview")}">
+    <svg viewBox="0 0 ${width} ${height}" data-y-min-m="${yMin}" data-y-max-m="${yMax}" preserveAspectRatio="${preserveAspectRatio}" role="img" aria-label="${escapeHtml(title || "Profile preview")}">
       <defs>
         <linearGradient id="${gradientId}" x1="0" x2="0" y1="0" y2="1">
           <stop offset="0%" stop-color="${COLORS.water}" stop-opacity="0.92" />
@@ -1432,7 +1736,7 @@ function renderProfileSvg({
       <rect x="0" y="0" width="${width}" height="${height}" fill="transparent" />
       ${gridX.map((value) => `<line x1="${xScale(value)}" y1="${padding.top}" x2="${xScale(value)}" y2="${padding.top + chartHeight}" stroke="rgba(17,49,76,0.08)" stroke-width="1" />`).join("")}
       ${gridY.map((value) => `<line x1="${padding.left}" y1="${yScale(value)}" x2="${padding.left + chartWidth}" y2="${yScale(value)}" stroke="rgba(17,49,76,0.08)" stroke-width="1" />`).join("")}
-      <rect x="${xScale(displayXMin)}" y="${yScale(displayWaterLevel)}" width="${Math.max(xScale(xWaterEnd) - xScale(displayXMin), 0)}" height="${Math.max(yScale(displayYMin) - yScale(displayWaterLevel), 0)}" fill="${COLORS.water}" opacity="0.82" />
+      ${Number.isFinite(waterLevel) ? `<rect x="${xScale(displayXMin)}" y="${yScale(displayWaterLevel)}" width="${Math.max(xScale(xWaterEnd) - xScale(displayXMin), 0)}" height="${Math.max(yScale(displayYMin) - yScale(displayWaterLevel), 0)}" fill="${COLORS.water}" opacity="0.82" />` : ""}
       <path d="${filledBeachPath}" fill="${COLORS.sand}" opacity="0.95" />
       <path d="${beachPath}" fill="none" stroke="${COLORS.sandEdge}" stroke-width="3" />
       ${pierDeckMarkup}
@@ -1440,7 +1744,7 @@ function renderProfileSvg({
       ${legendMarkup}
       ${hasTitle ? `<text x="${padding.left}" y="16" fill="#102338" font-size="16" font-weight="800">${escapeHtml(title)}</text>` : ""}
       ${footerMarkup}
-      <text x="${width / 2}" y="${height - 10}" fill="#60748a" font-size="12" text-anchor="middle">${escapeHtml(getDistanceAxisLabel())}</text>
+      <text x="${width / 2}" y="${height - 10}" fill="#60748a" font-size="12" text-anchor="middle">${escapeHtml(xAxisLabel)}</text>
       <text x="18" y="${height / 2}" fill="#60748a" font-size="12" text-anchor="middle" transform="rotate(-90, 18, ${height / 2})">${escapeHtml(getElevationAxisLabel())}</text>
       ${gridY.map((value) => `<text x="${padding.left - 10}" y="${yScale(value) + 4}" fill="#60748a" font-size="12" text-anchor="end">${value.toFixed(1)}</text>`).join("")}
     </svg>
@@ -1924,7 +2228,7 @@ async function loadWindForecastSeries(transect, startMs, endMs) {
     throw new Error("Selected transect does not include a valid NWS wind forecast point.");
   }
 
-  const cacheKey = `${lat.toFixed(4)},${lon.toFixed(4)}:${startMs}:${endMs}`;
+  const cacheKey = `${getWindChopModelKey(transect)}:${lat.toFixed(4)},${lon.toFixed(4)}:${startMs}:${endMs}`;
   const cached = state.windCache.get(cacheKey);
   const nowMs = Date.now();
   if (cached && cached.expiresAtMs > nowMs) {
@@ -1950,7 +2254,7 @@ async function loadWindForecastSeries(transect, startMs, endMs) {
     .filter((point) => Number.isFinite(point.value));
   const chopIntervals = speedIntervals.map((point) => ({
     ...point,
-    value: estimateChopHeightMeters(point.value),
+    value: estimateSiteChopHeightMeters(transect, point.value),
   }));
 
   const series = {
@@ -1993,7 +2297,7 @@ async function loadHistoricalWindSeries(transect, startMs, endMs) {
     throw new Error("Selected transect does not include a valid historical wind point.");
   }
 
-  const cacheKey = `historical:${lat.toFixed(4)},${lon.toFixed(4)}:${startMs}:${endMs}`;
+  const cacheKey = `historical:${getWindChopModelKey(transect)}:${lat.toFixed(4)},${lon.toFixed(4)}:${startMs}:${endMs}`;
   const cached = state.windCache.get(cacheKey);
   const nowMs = Date.now();
   if (cached && cached.expiresAtMs > nowMs) {
@@ -2010,7 +2314,7 @@ async function loadHistoricalWindSeries(transect, startMs, endMs) {
 
   const chopIntervals = speedIntervals.map((point) => ({
     ...point,
-    value: estimateChopHeightMeters(point.value),
+    value: estimateSiteChopHeightMeters(transect, point.value),
   }));
 
   const series = {
@@ -2081,7 +2385,7 @@ function parseOpenMeteoHourlyWindIntervals(hourly, windowStartMs, windowEndMs) {
   return times
     .map((timeText, index) => {
       const startMs = Date.parse(`${timeText}Z`);
-      const value = Number(speeds[index]);
+      const value = speeds[index] == null || speeds[index] === "" ? NaN : Number(speeds[index]);
       if (!Number.isFinite(startMs) || !Number.isFinite(value)) {
         return null;
       }
@@ -2129,7 +2433,7 @@ function parseNwsGridLayerIntervals(layer, windowStartMs, windowEndMs) {
   return (layer?.values || [])
     .map((row) => {
       const interval = parseNwsValidTimeInterval(row.validTime);
-      const value = Number(row.value);
+      const value = row.value == null || row.value === "" ? NaN : Number(row.value);
       if (!interval || !Number.isFinite(value)) {
         return null;
       }
@@ -2200,6 +2504,16 @@ function normalizeNwsWindSpeedKmh(value, unitCode) {
     return value * 1.852;
   }
   return value;
+}
+
+function getWindChopModelKey(site) {
+  return site?.type === "bay" ? `jonswap:${site.worstCaseFetchMeters}:${CHOP_PROXY_MAX_PERIOD_SECONDS}` : "pm";
+}
+
+function estimateSiteChopHeightMeters(site, windSpeedKmh) {
+  return site?.type === "bay"
+    ? estimateFetchLimitedChopMeters(windSpeedKmh, site.worstCaseFetchMeters, CHOP_PROXY_MAX_PERIOD_SECONDS)
+    : estimateChopHeightMeters(windSpeedKmh);
 }
 
 function estimateChopHeightMeters(windSpeedKmh) {
@@ -2759,12 +3073,16 @@ function renderCharts(forecastDataset, tideSeries, windSeries = null) {
   const windSpeedPoints = (windSeries?.speedPoints || []).map((point) => ({ x: point.x, y: convertWindSpeedForDisplay(point.y) }));
   const chopPoints = (windSeries?.chopPoints || []).map((point) => ({ x: point.x, y: convertLengthForDisplay(point.y) }));
   const hasWindData = Boolean(windSpeedPoints.length || chopPoints.length);
-  const timeMin = getPlaybackStartTime(forecastDataset.waveTimeMs, forecastDataset.waveTimeMs[0]);
-  const timeMax = forecastDataset.waveTimeMs.at(-1);
+  const timeMin = isBayPoint() ? state.currentTideWindow.startMs : getPlaybackStartTime(forecastDataset.waveTimeMs, forecastDataset.waveTimeMs[0]);
+  const timeMax = isBayPoint() ? state.currentTideWindow.endMs : forecastDataset.waveTimeMs.at(-1);
 
   dom.waveChartTitle.textContent = `MOP Wave Forecast - Transect ${state.selectedTransect.label}`;
   dom.tideChartTitle.textContent = formatTideChartTitle(state.selectedTideStation || { id: tideSeries.stationId });
   dom.windChartTitle.textContent = formatWindChartTitle(windSeries);
+  if (isBayPoint()) {
+    dom.waveChartTitle.textContent = `Harbor Entrance Wave Conditions - ${state.selectedTransect.entranceTransect} (context only)`;
+    dom.windChartTitle.textContent = `${state.hindcastWindow ? "Open-Meteo Historical Bay Wind" : "NWS Bay Wind"} / Fetch-Limited Chop`;
+  }
 
   destroyForecastCharts();
 
@@ -2803,6 +3121,7 @@ function renderCharts(forecastDataset, tideSeries, windSeries = null) {
         legend: { display: false },
         tooltip: { callbacks: { title: tooltipTimeTitle } },
         currentTimeLine: { value: state.results?.[state.currentIndex]?.timeMs, color: COLORS.aqua },
+        emptyStateMessage: { message: "Harbor entrance waves unavailable; bay assessment is independent." },
       },
       scales: {
         x: {
@@ -2993,7 +3312,8 @@ function renderCharts(forecastDataset, tideSeries, windSeries = null) {
     },
   });
 
-  dom.forecastWindowLabel.textContent = `${formatShortDateTime(forecastDataset.waveTimeMs[0])} to ${formatShortDateTime(forecastDataset.waveTimeMs.at(-1))} ${getTimeModeLabel()}`;
+  dom.forecastWindowLabel.textContent = `${formatShortDateTime(timeMin)} to ${formatShortDateTime(timeMax)} ${getTimeModeLabel()}`;
+  if (isBayPoint()) state.tideChart.options.plugins.overtoppingBackground.windows = buildBayFloodWindows(state.results || []);
   renderSpectrumChart(forecastDataset);
 }
 
@@ -3056,12 +3376,14 @@ function updateSpectrumChart(forecastDataset, index) {
     return;
   }
   const spectra = forecastDataset?.amplitudeSpectra;
+  if (isBayPoint()) index = nearestEntranceIndex(forecastDataset, state.results?.[state.currentIndex]?.timeMs);
   const frame = spectra?.frames[index];
   const displayBins = getSpectrumDisplayBins(spectra);
   const amplitudes = frame?.amplitudes
     ? displayBins.map((bin) => frame.amplitudes[bin.sourceIndex])
     : null;
   dom.spectrumChartTitle.textContent = `Discrete Amplitude Spectrum - Transect ${state.selectedTransect.label}`;
+  if (isBayPoint()) dom.spectrumChartTitle.textContent = `Harbor Entrance Spectrum - ${state.selectedTransect.entranceTransect} (nearest ${state.hindcastWindow ? "hindcast" : "forecast"} time)`;
   const timeMs = forecastDataset?.waveTimeMs[index];
   dom.spectrumTimeLabel.textContent = Number.isFinite(timeMs) ? `${formatShortDateTime(timeMs)} ${getTimeModeLabel()}` : "--";
   const dataset = state.spectrumChart.data.datasets[0];
@@ -3077,6 +3399,10 @@ function updateSpectrumChart(forecastDataset, index) {
 }
 
 function updatePlaybackUI() {
+  if (isBayPoint()) {
+    updateBayPlaybackUI();
+    return;
+  }
   if (!state.results || !state.selectedForecast) {
     return;
   }
@@ -3220,7 +3546,26 @@ function stopPlayback() {
   dom.playPauseButton.textContent = "Play";
 }
 
+function syncBayMarkers() {
+  if (!state.map) return;
+  const zoom = state.map.getZoom();
+  const size = Math.round(clamp(8 + (zoom - TRANSECT_ZOOM_THRESHOLD) * 2, 8, 24));
+  for (const marker of state.bayMarkers.values()) {
+    if (zoom < TRANSECT_ZOOM_THRESHOLD) {
+      if (state.map.hasLayer(marker)) state.map.removeLayer(marker);
+      continue;
+    }
+    if (marker.options.icon.options.iconSize[0] !== size) {
+      marker.setIcon(L.divIcon({ className: "bay-point-marker",
+        html: `<span class="bay-key" style="width:${size}px;height:${size}px"></span>`,
+        iconSize: [size, size], iconAnchor: [size / 2, size / 2] }));
+    }
+    if (!state.map.hasLayer(marker)) marker.addTo(state.map);
+  }
+}
+
 function syncVisibleTransects() {
+  syncBayMarkers();
   if (!state.map || !state.transects.length) {
     return;
   }
@@ -3251,7 +3596,7 @@ function syncVisibleTransects() {
   }
 
   const selectedLabel = state.selectedTransect?.label;
-  if (selectedLabel && !visibleTransects.some((transect) => transect.label === selectedLabel)) {
+  if (selectedLabel && !isBayPoint() && !visibleTransects.some((transect) => transect.label === selectedLabel)) {
     visibleTransects.unshift(state.selectedTransect);
   }
 

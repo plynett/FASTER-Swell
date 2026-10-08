@@ -865,6 +865,48 @@ a.status-pill:hover {
   display: none;
 }
 
+.bay-map-link {
+  color: #fff;
+  pointer-events: auto;
+  text-decoration: underline;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.bay-key {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border: 2px solid #fff;
+  background: #136a98;
+  border-radius: 50%;
+  box-shadow: 0 0 0 1px #136a98;
+}
+
+.bay-source-note {
+  color: var(--muted);
+  font-size: 0.78rem;
+  line-height: 1.5;
+  margin: 12px 0 0;
+}
+
+.bay-mode .profile-preview {
+  flex: 1;
+}
+
+.bay-mode .form-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.bay-mode .field input {
+  margin-top: auto;
+}
+
+input[readonly] {
+  background: #edf4f8;
+}
+
 .chart-stack {
   display: flex;
   flex-direction: column;
@@ -1130,6 +1172,10 @@ svg text {
 }
 
 @media (max-width: 900px) {
+  .bay-mode .form-grid {
+    grid-template-columns: 1fr;
+  }
+
   .topbar {
     flex-direction: column;
     align-items: flex-start;
