@@ -244,7 +244,7 @@
                 A<sub>SL</sub> = mean(&eta;<sub>obs</sub> - &eta;<sub>pred</sub>)<br>
                 &eta;(t) = &eta;<sub>NOAA,pred</sub>(t) + A<sub>SL</sub>
               </div>
-              <p>The Explorer uses the nearest NOAA tide station, NAVD88 datum, and a three-day lookback ending one hour before the run. Observed water levels are paired to six-minute predictions in the same datum, with a minimum of 24 paired residuals. If the residual estimate is unavailable, the current sea-level anomaly field value is retained.</p>
+              <p>The Explorer uses the nearest NOAA tide station, NAVD88 datum, and a three-day lookback ending one hour before the run. Observed water levels are paired to six-minute predictions in the same datum, with a minimum of 24 paired residuals. Only valid numeric observations and predictions contribute to the mean; blank or missing readings are excluded, never filled with zero. Genuine zero and negative water levels are retained. If the residual estimate is unavailable, the current sea-level anomaly field value is retained.</p>
               <p class="equation-ref">Source: current Explorer implementation in <code>app.js</code>.</p>
             </article>
             <article class="equation-card">

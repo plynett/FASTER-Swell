@@ -608,6 +608,9 @@ function bayWallFigure(container, row = null) {
   return renderProfileSvg({
     profile: buildBayWallProfile(state.modelParams.groundElevation, limits.yMin),
     ...limits, waterLevel, overlays, showLegend: Boolean(row),
+    legendNote: row && (row.category.rank === 2 || row.category.rank === 3) && Number.isFinite(row.uncertaintyElevation)
+      ? { label: "Water depth above ground / structure", value: formatDisplayLength(row.uncertaintyElevation - state.modelParams.groundElevation, 2) }
+      : null,
     figureAspectRatio: getContainerAspectRatio(container, DEFAULT_FIGURE_RATIO), minFigureHeight: 160,
     xAxisLabel: "Harbor / Ground (schematic)",
     title: row ? `Flooding profile at ${formatShortDateTime(row.timeMs)} ${getTimeModeLabel()} - ${row.category.label}` : "",
@@ -788,7 +791,7 @@ function updateBayPlaybackUI() {
   const incomplete = summary.hasGaps || state.results[0].timeMs > state.currentTideWindow.startMs + BAY_STEP_MS
     || state.results.at(-1).timeMs < state.currentTideWindow.endMs - BAY_STEP_MS;
   dom.categoryPill.textContent = summary.category.rank === null ? summary.category.label
-    : incomplete ? `${summary.category.label} in available ${state.hindcastWindow ? "hindcast" : "forecast"} data (some times unassessed)`
+    : incomplete ? `${summary.category.label} in available ${state.hindcastWindow ? "hindcast" : "forecast"} data`
       : formatForecastOvertoppingLabel(summary.category, state.results.slice(start));
   dom.categoryPill.style.background = summary.category.background;
   dom.categoryPill.style.color = summary.category.color;
@@ -1627,6 +1630,7 @@ function renderProfileSvg({
   footerLines = [],
   preserveAspectRatio = "xMidYMid meet",
   showLegend = false,
+  legendNote = null,
   xAxisLabel = getDistanceAxisLabel(),
 }) {
   const width = 940;
@@ -1724,6 +1728,13 @@ function renderProfileSvg({
       </g>
     `
     : "";
+  const legendNoteMarkup = legendItems.length && legendNote
+    ? `<g data-profile-legend-note transform="translate(${legendX}, ${legendY - 62})">
+        <rect width="${legendWidth}" height="54" rx="14" fill="rgba(255,255,255,0.9)" stroke="rgba(17,49,76,0.14)" />
+        <text x="12" y="20" fill="#102338" font-size="12" font-weight="700">${escapeHtml(legendNote.label)}</text>
+        <text x="12" y="42" fill="#102338" font-size="18" font-weight="800">${escapeHtml(legendNote.value)}</text>
+      </g>`
+    : "";
 
   return `
     <svg viewBox="0 0 ${width} ${height}" data-y-min-m="${yMin}" data-y-max-m="${yMax}" preserveAspectRatio="${preserveAspectRatio}" role="img" aria-label="${escapeHtml(title || "Profile preview")}">
@@ -1742,6 +1753,7 @@ function renderProfileSvg({
       ${pierDeckMarkup}
       ${overlayMarkup}
       ${legendMarkup}
+      ${legendNoteMarkup}
       ${hasTitle ? `<text x="${padding.left}" y="16" fill="#102338" font-size="16" font-weight="800">${escapeHtml(title)}</text>` : ""}
       ${footerMarkup}
       <text x="${width / 2}" y="${height - 10}" fill="#60748a" font-size="12" text-anchor="middle">${escapeHtml(xAxisLabel)}</text>
@@ -2205,10 +2217,14 @@ async function loadTideSeries(stationId, startMs, endMs) {
     throw new Error(payload.error?.message || "NOAA tide payload did not include predictions.");
   }
 
+  const points = parseNoaaWaterLevelRows(payload.predictions, { stationId, product: "predictions" });
+  if (!points.length) {
+    throw new Error("NOAA tide payload did not include valid predictions.");
+  }
   const tideSeries = {
     stationId,
-    timeMs: payload.predictions.map((row) => Date.parse(`${row.t}Z`)),
-    level: payload.predictions.map((row) => Number(row.v)),
+    timeMs: points.map((point) => point.timeMs),
+    level: points.map((point) => point.level),
   };
   console.info("[FASTER NOAA] Loaded hourly tide predictions.", {
     stationId,
@@ -2597,6 +2613,14 @@ async function loadSeaLevelAnomalyEstimate(stationId, window = null) {
     predictedCount: predictedSeries.length,
     isHistoricalWindow: Boolean(window),
   };
+  console.info("[FASTER NOAA] Sea-level anomaly from valid observed-minus-predicted pairs.", {
+    ...estimate,
+    start: new Date(startMs).toISOString(),
+    end: new Date(endMs).toISOString(),
+    units: "meters",
+    minimumResidual: Math.min(...residuals),
+    maximumResidual: Math.max(...residuals),
+  });
   state.seaLevelAnomalyCache.set(cacheKey, {
     estimate,
     expiresAtMs: nowMs + SEA_LEVEL_ANOMALY_CACHE_TTL_MS,
@@ -2632,13 +2656,28 @@ async function loadNoaaWaterLevelSeries({ stationId, product, interval, startMs,
     throw new Error(payload.error?.message || `NOAA ${product} payload did not include data.`);
   }
 
-  return rows
-    .map((row) => ({
-      timeMs: Date.parse(`${row.t}Z`),
-      level: Number(row.v),
-    }))
-    .filter((point) => Number.isFinite(point.timeMs) && Number.isFinite(point.level))
-    .sort((left, right) => left.timeMs - right.timeMs);
+  return parseNoaaWaterLevelRows(rows, { stationId, product });
+}
+
+function parseNoaaWaterLevelRows(rows, context = {}) {
+  const points = [];
+  for (const row of rows) {
+    // NOAA reports missing observations as empty strings; Number("") would invent a zero.
+    const value = row?.v;
+    if (typeof value !== "number" && (typeof value !== "string" || !value.trim())) continue;
+    const level = Number(value);
+    const timeMs = typeof row.t === "string" ? Date.parse(`${row.t}Z`) : NaN;
+    if (Number.isFinite(level) && Number.isFinite(timeMs)) points.push({ timeMs, level });
+  }
+  if (points.length !== rows.length) {
+    console.warn("[FASTER NOAA] Skipped missing or invalid water-level samples (not filled with zero).", {
+      ...context,
+      received: rows.length,
+      valid: points.length,
+      skipped: rows.length - points.length,
+    });
+  }
+  return points.sort((left, right) => left.timeMs - right.timeMs);
 }
 
 function pairObservedAndPredictedResiduals(observedSeries, predictedSeries) {
@@ -2646,6 +2685,7 @@ function pairObservedAndPredictedResiduals(observedSeries, predictedSeries) {
   const residuals = [];
 
   observedSeries.forEach((observedPoint) => {
+    if (!Number.isFinite(observedPoint.timeMs) || !Number.isFinite(observedPoint.level)) return;
     const exactPrediction = predictedByTime.get(observedPoint.timeMs);
     const predictedLevel = Number.isFinite(exactPrediction)
       ? exactPrediction
@@ -2663,6 +2703,7 @@ function findNearestLevelWithin(series, targetMs, toleranceMs) {
   let bestDelta = Number.POSITIVE_INFINITY;
 
   series.forEach((point) => {
+    if (!Number.isFinite(point.timeMs) || !Number.isFinite(point.level)) return;
     const delta = Math.abs(point.timeMs - targetMs);
     if (delta < bestDelta) {
       bestDelta = delta;
