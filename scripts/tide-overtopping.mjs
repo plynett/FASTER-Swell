@@ -33,7 +33,7 @@ export function buildOvertoppingWindows(results = [], tideSeries = null) {
       return {
         start: result.timeMs - (extendBefore ? EXTENDED_HALF_WIDTH_MS : DEFAULT_HALF_WIDTH_MS),
         end: result.timeMs + (extendAfter ? EXTENDED_HALF_WIDTH_MS : DEFAULT_HALF_WIDTH_MS),
-        rank: result.category.rank >= 2 ? 2 : 1,
+        rank: result.category.rank,
       };
     });
   const times = [...new Set(windows.flatMap((window) => [window.start, window.end]))].sort((a, b) => a - b);
@@ -66,7 +66,8 @@ export const overtoppingBackgroundPlugin = {
       const start = Math.max(left, chart.scales.x.getPixelForValue(window.start));
       const end = Math.min(right, chart.scales.x.getPixelForValue(window.end));
       if (end <= start) continue;
-      ctx.fillStyle = window.rank >= 2 ? "rgba(204,75,55,0.22)" : "rgba(243,194,55,0.30)";
+      ctx.fillStyle = window.rank >= 3 ? "rgba(153,15,30,0.38)"
+        : window.rank === 2 ? "rgba(204,75,55,0.22)" : "rgba(243,194,55,0.30)";
       ctx.fillRect(start, top, end - start, bottom - top);
     }
     ctx.restore();

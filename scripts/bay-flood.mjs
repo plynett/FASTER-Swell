@@ -5,8 +5,8 @@ export const BAY_MAJOR_EXCEEDANCE_METERS = 0.1524; // 0.5 ft above ground/struct
 
 function category(rank, label) {
   return { rank, label, figureLabel: label, forecastLabel: label,
-    background: rank >= 2 ? "rgba(204,75,55,0.18)" : rank === 1 ? "rgba(243,194,55,0.24)" : "rgba(17,49,76,0.12)",
-    color: rank >= 2 ? "#9b2f1d" : rank === 1 ? "#80600c" : "#11314c" };
+    background: rank === 3 ? "rgba(153,15,30,0.24)" : rank === 2 ? "rgba(204,75,55,0.18)" : rank === 1 ? "rgba(243,194,55,0.24)" : "rgba(17,49,76,0.12)",
+    color: rank === 3 ? "#780b17" : rank === 2 ? "#9b2f1d" : rank === 1 ? "#80600c" : "#11314c" };
 }
 
 export function classifyBayFlooding(waterLevel, uncertaintyElevation, chopElevation, groundElevation) {
@@ -46,7 +46,7 @@ export function buildBayFloodWindows(results) {
   const bands = [];
   for (const row of results) {
     if (!(row.category.rank > 0)) continue;
-    const band = { start: row.timeMs - BAY_STEP_MS / 2, end: row.timeMs + BAY_STEP_MS / 2, rank: row.category.rank >= 2 ? 2 : 1 };
+    const band = { start: row.timeMs - BAY_STEP_MS / 2, end: row.timeMs + BAY_STEP_MS / 2, rank: row.category.rank };
     const previous = bands.at(-1);
     if (previous?.end === band.start && previous.rank === band.rank) previous.end = band.end;
     else bands.push(band);

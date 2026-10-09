@@ -3899,8 +3899,8 @@ function classifyOvertopping({ expectedRunup, conservativeRunup, upperBoundRunup
       label: "Significant overtopping probable",
       forecastLabel: "Significant Overtopping probable",
       figureLabel: "Significant Overtopping Probable",
-      background: "rgba(229, 103, 82, 0.18)",
-      color: "#9b2f1d",
+      background: "rgba(153,15,30,0.24)",
+      color: "#780b17",
     };
   }
   if (conservativeRunup > duneCrestElevation) {
@@ -3909,8 +3909,8 @@ function classifyOvertopping({ expectedRunup, conservativeRunup, upperBoundRunup
       label: "Moderate overtopping possible",
       forecastLabel: "Moderate Overtopping possible",
       figureLabel: "Moderate Overtopping Possible",
-      background: "rgba(243, 194, 107, 0.22)",
-      color: "#8a5d0a",
+      background: "rgba(204,75,55,0.18)",
+      color: "#9b2f1d",
     };
   }
   if (upperBoundRunup > duneCrestElevation ||
